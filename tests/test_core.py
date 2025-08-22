@@ -1,11 +1,12 @@
 from functools import partial
+from dataclasses import dataclass
 
 import jax.numpy as jnp
 import pytest
 import torch
 from jax import grad, jit, vmap
 
-from torch2jax import t2j
+from torch2jax import Torchish, _tree_coerce, t2j
 
 from .utils import Torchish_member_test, aac, backward_test, forward_test, out_kwarg_test, t2j_function_test
 
@@ -53,6 +54,35 @@ def test_ones_like():
   t2j_function_test(torch.ones_like, [()], tests=tests)
   t2j_function_test(torch.ones_like, [(2,)], tests=tests)
   t2j_function_test(torch.ones_like, [(2, 3)], tests=tests)
+
+
+def test_tree_coerce():
+  @dataclass
+  class A:
+    a: torch.Tensor
+
+  @dataclass
+  class B:
+    a: A
+    b: int
+
+  torch.utils._pytree.register_dataclass(A)
+  torch.utils._pytree.register_dataclass(B)
+
+  # construct pytorch tree
+  t1 = torch.return_types.max([1, Torchish(jnp.ones((3,)))])
+  t2 = torch.return_types.topk([3.0, t1])
+  t3 = A(Torchish(jnp.ones((3, 4))))
+  t4 = B(t3, 7)
+  t5 = (t2, t3, t4)
+
+  # construct expected output jax tree
+  j1 = torch.return_types.max([1, jnp.ones((3,))])
+  j2 = torch.return_types.topk([3.0, j1])
+  j3 = A(jnp.ones((3, 4)))
+  j4 = B(j3, 7)
+  j5 = (j2, j3, j4)
+  aac(_tree_coerce(t5), j5)
 
 
 def test_tensor():
