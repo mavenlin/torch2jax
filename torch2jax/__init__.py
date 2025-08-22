@@ -1320,7 +1320,7 @@ def t2j_function(f):
         with TorchishMode():
           out = f(*torch_args)
     # use the torch's tree_map, because out is generated from torch code
-    return torch.utils._pytree.tree_map(lambda x: x.value if isinstance(x, Torchish) else x, out)
+    return _tree_coerce(out)
 
   return f_jax
 
