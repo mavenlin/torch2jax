@@ -277,6 +277,10 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
   """Register a torch function override"""
 
   def decorator(func):
+    def scoped_func(*args, **kwargs):
+      with jax.named_scope("t2j/" + torch_function.__name__):
+        return func(*args, **kwargs)
+
     if out_kwarg:
 
       def assign(a, b):
@@ -284,15 +288,15 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
 
       def func1(*args, out=None, **kwargs):
         if out is not None:
-          ret = func(*args, **kwargs)
+          ret = scoped_func(*args, **kwargs)
           torch_tree_map(assign, out, ret)
           return out
         else:
           return torch_tree_map(Torchish, func(*args, **kwargs))
     elif Torchishify_output:
-      func1 = lambda *args, **kwargs: torch_tree_map(Torchish, func(*args, **kwargs))
+      func1 = lambda *args, **kwargs: torch_tree_map(Torchish, scoped_func(*args, **kwargs))
     else:
-      func1 = func
+      func1 = scoped_func
     functools.update_wrapper(func1, torch_function)
     HANDLED_FUNCTIONS[torch_function] = func1
     if Torchish_member:
