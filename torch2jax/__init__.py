@@ -284,18 +284,12 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
 
       def func1(*args, out=None, **kwargs):
         if out is not None:
-          # an example of a function that requires a non-array out value is torch.max
-          # where out is a tuple of two tensors.
           ret = func(*args, **kwargs)
           torch_tree_map(assign, out, ret)
           return out
         else:
           return torch_tree_map(Torchish, func(*args, **kwargs))
     elif Torchishify_output:
-      # although func is jax code, but it is used to mock the torch function, therefore the returning container (if any) should be torch types
-      # e.g. torch.return_types.max, therefore, we use torch_tree_map here instead of jax.tree.map
-      # Registration of `torch.return_types` happens only when casting back to Jax. So it could be
-      # unregistered when we call this line, therefore we use torch tree_map instead of jax.tree.map
       func1 = lambda *args, **kwargs: torch_tree_map(Torchish, func(*args, **kwargs))
     else:
       func1 = func
@@ -501,6 +495,18 @@ def masked_fill(self, mask, value):
   mask, value = _v(mask), _coerce(value)
   value = jnp.broadcast_to(value, self.value.shape)
   return jnp.where(mask, value, self.value)
+
+
+@implements(torch.max, out_kwarg=True, Torchish_member=True)
+def max(input, dim=None, keepdim=False):
+  if dim is None:
+    return jnp.max(_v(input))
+  indices = jnp.argmax(_v(input), axis=dim, keepdims=True)
+  values = jnp.take_along_axis(_v(input), indices, axis=dim)
+  if not keepdim:
+    values = jnp.squeeze(values, axis=dim)
+    indices = jnp.squeeze(indices, axis=dim)
+  return torch.return_types.max([values, indices])
 
 
 @implements(torch.mean, out_kwarg=True, Torchish_member=True)
