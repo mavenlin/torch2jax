@@ -182,8 +182,11 @@ class Torchish:
   def dim(self): return self.ndim
   def float(self): return Torchish(jnp.astype(self.value, jnp.float32))
   def item(self): return self.value.item()
+  def long(self, *args, **kwargs): return Torchish(jnp.astype(self.value, jnp.int64))
+  def new_ones(self, *args, **kwargs): return torch.ones(*args, dtype=self.dtype, **kwargs)
+  def new_zeros(self, *args, **kwargs): return torch.zeros(*args, dtype=self.dtype, **kwargs)
   def permute(self, *shape): return torch.permute(self, shape)
-  def size(self): return self.shape
+  def size(self, dim=None): return self.shape if dim is None else self.value.shape[dim]
   def to(self, *args, **kwargs): return self  # ignore device movement, jax manages its own placement.
   # fmt: on
 
@@ -737,6 +740,8 @@ def scatter_add(input, dim, index, src):
 
 @implements(torch.softmax, Torchish_member=True)
 def softmax(input, dim, *, dtype=None):
+  if dim is None:
+    dim = -1
   output = jax.nn.softmax(_v(input), axis=dim)
   if dtype is not None:
     output = jnp.astype(output, t2j_dtype(dtype))
@@ -1339,21 +1344,21 @@ def silu(input, inplace=False):
     return Torchish(jax.nn.silu(_v(input)))
 
 
-@implements(torch.nn.functional.softmax)
+@implements(torch.nn.functional.softmax, Torchishify_output=False)
 def nn_functional_softmax(input, dim=None, _stacklevel=3, dtype=None):
   # this function has already been implemented in `torch.softmax`
-  return softmax(input, dim, dtype)
+  return softmax(input, dim, dtype=dtype)
 
 
-@implements(torch.nn.functional.softmin)
+@implements(torch.nn.functional.softmin, Torchishify_output=False)
 def softmin(input, dim=None, _stacklevel=3, dtype=None):
-  return jax.nn.softmax(-_v(input), axis=dim, dtype=t2j_dtype(dtype))
+  return softmax(-input, dim, dtype=dtype)
 
 
 @implements(torch.nn.functional.softplus)
 def softplus(input, beta=1, threshold=20):
   input = _v(input)
-  value = jax.nn.softplus(input * beta) / beta
+  value = jnp.logaddexp(0, input * beta) / beta
   return jnp.where(input > threshold, input, value)
 
 
@@ -1418,7 +1423,9 @@ def prelu(input: Torchish, weight: Torchish):
 
 
 @implements(torch.nn.functional.scaled_dot_product_attention)
-def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+def scaled_dot_product_attention(
+  query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
+):
   assert dropout_p == 0.0, "TODO: implement dropout"
   Q, K, V = _v(query), _v(key), _v(value)
   # torch has (batch, num_heads, seq_len, head_dim) for Q, K, V

@@ -65,6 +65,12 @@ def test_ones():
     test(lambda out=None: torch.ones((2, 3), out=out), [])
 
 
+def test_Tensor_new():
+  tests = [forward_test]
+  t2j_function_test(lambda x: x.new_ones((4, 5)), [(2, 3)], tests=tests)
+  t2j_function_test(lambda x: x.new_zeros((4, 5)), [(2, 3)], tests=tests)
+
+
 def test_ones_like():
   tests = [forward_test]
   t2j_function_test(torch.ones_like, [()], tests=tests)

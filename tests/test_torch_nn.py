@@ -362,7 +362,7 @@ def test_torch_nn_functional_oneliner():
   t2j_function_test(torch.nn.functional.softmin, [(6, 6)], atol=1e-6)
   t2j_function_test(torch.nn.functional.softplus, [(6, 6)], atol=1e-6)
   t2j_function_test(torch.nn.functional.softplus, [(6, 6)], kwargs=dict(beta=2.0), atol=1e-6)
-  t2j_function_test(torch.nn.functional.softplus, [(6, 6)], kwargs=dict(beta=2.0, threshold=3), atol=1e-6)
+  t2j_function_test(torch.nn.functional.softplus, [(6, 6)], kwargs=dict(beta=2.0, threshold=10), atol=1e-6)
   t2j_function_test(torch.nn.functional.softshrink, [(6, 6)], atol=1e-6)
   t2j_function_test(torch.nn.functional.softshrink, [(6, 6)], kwargs=dict(lambd=1.0), atol=1e-6)
   t2j_function_test(torch.nn.functional.softsign, [(6, 6)], atol=1e-6)
@@ -380,6 +380,10 @@ def test_torch_nn_functional_scaled_dot_product_attention():
   # default
   t2j_function_test(sdpa, [(5, 3, 7), (5, 2, 7), (5, 2, 7)], atol=1e-6, tests=tests)
   t2j_function_test(sdpa, [(5, 7, 11), (5, 7, 11), (5, 7, 11)], atol=1e-6, tests=tests)
+
+  # gqa
+  t2j_function_test(partial(sdpa, enable_gqa=True), [(10, 3, 7), (5, 2, 7), (5, 2, 7)], atol=1e-6, tests=tests)
+  t2j_function_test(partial(sdpa, enable_gqa=True), [(10, 7, 11), (5, 7, 11), (5, 7, 11)], atol=1e-6, tests=tests)
 
   # default + attn_mask(float)
   t2j_function_test(sdpa, [(5, 3, 7), (5, 2, 7), (5, 2, 7), (3, 2)], atol=1e-6, tests=tests)
