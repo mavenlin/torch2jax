@@ -276,14 +276,18 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
   def decorator(func):
     if out_kwarg:
 
+      def assign(a, b):
+        a.value = b
+
       def func1(*args, out=None, **kwargs):
         if out is not None:
-          out.value = func(*args, **kwargs)
+          ret = func(*args, **kwargs)
+          torch_tree_map(assign, out, ret)
           return out
         else:
-          return Torchish(func(*args, **kwargs))
+          return torch_tree_map(Torchish, func(*args, **kwargs))
     elif Torchishify_output:
-      func1 = lambda *args, **kwargs: Torchish(func(*args, **kwargs))
+      func1 = lambda *args, **kwargs: torch_tree_map(Torchish, func(*args, **kwargs))
     else:
       func1 = func
     functools.update_wrapper(func1, torch_function)
@@ -483,6 +487,18 @@ def masked_fill(self, mask, value):
   mask, value = _v(mask), _coerce(value)
   value = jnp.broadcast_to(value, self.value.shape)
   return jnp.where(mask, value, self.value)
+
+
+@implements(torch.max, out_kwarg=True, Torchish_member=True)
+def max(input, dim=None, keepdim=False):
+  if dim is None:
+    return jnp.max(_v(input))
+  indices = jnp.argmax(_v(input), axis=dim, keepdims=True)
+  values = jnp.take_along_axis(_v(input), indices, axis=dim)
+  if not keepdim:
+    values = jnp.squeeze(values, axis=dim)
+    indices = jnp.squeeze(indices, axis=dim)
+  return torch.return_types.max([values, indices])
 
 
 @implements(torch.mean, out_kwarg=True, Torchish_member=True)
@@ -729,7 +745,10 @@ def softmax(input, dim, *, dtype=None):
 
 @implements(torch.sort, out_kwarg=True, Torchish_member=True)
 def sort(input, dim=-1, descending=False, stable=False):
-  return jnp.sort(_v(input), axis=dim, stable=stable, descending=descending)
+  input = _v(input)
+  sorted_indices = jnp.argsort(input, axis=dim, stable=stable, descending=descending)
+  sorted_values = jnp.take_along_axis(input, sorted_indices, axis=dim)
+  return torch.return_types.sort([sorted_values, sorted_indices])
 
 
 @implements(torch.squeeze, Torchish_member=True)
@@ -750,6 +769,31 @@ def tensor(data, dtype=None, device=None, requires_grad=False, pin_memory=False)
     data.value if isinstance(data, Torchish) else data,
     dtype=(t2j_dtype(dtype) if dtype is not None else None),
   )
+
+
+@implements(torch.topk, out_kwarg=True, Torchish_member=True)
+def topk(input, k, dim=None, largest=True, sorted=True):
+  input = _v(input)
+  dim = dim if dim is not None else -1
+  if dim != -1 and dim != input.ndim - 1:
+    input = jnp.swapaxes(input, dim, -1)
+
+  if largest:
+    values, indices = jax.lax.top_k(input, k)
+  else:
+    values, indices = jax.lax.top_k(-input, k)
+    values = -values
+
+  if sorted:
+    sort_indices = jnp.argsort(values, axis=-1, descending=largest)
+    values = jnp.take_along_axis(values, sort_indices, axis=-1)
+    indices = jnp.take_along_axis(indices, sort_indices, axis=-1)
+
+  if dim != -1 and dim != input.ndim - 1:
+    values = jnp.swapaxes(values, dim, -1)
+    indices = jnp.swapaxes(indices, dim, -1)
+
+  return torch.return_types.topk([values, indices])
 
 
 @implements(torch.unbind, Torchishify_output=False, Torchish_member=True)

@@ -55,7 +55,7 @@ def test_bernoulli():
 def test_multinomial():
   ### 1D input
   aac(
-    t2j(lambda w: torch.sort(torch.multinomial(w, w.shape[-1], replacement=False)))(
+    t2j(lambda w: torch.sort(torch.multinomial(w, w.shape[-1], replacement=False))[0])(
       jr.uniform(jrk(0), (10,)), rng=jrk(0)
     ),
     jnp.arange(10),
@@ -70,7 +70,7 @@ def test_multinomial():
 
   ### 2D input
   aac(
-    t2j(lambda w: torch.sort(torch.multinomial(w, w.shape[-1], replacement=False)))(
+    t2j(lambda w: torch.sort(torch.multinomial(w, w.shape[-1], replacement=False))[0])(
       jr.uniform(jrk(0), (3, 10)), rng=jrk(0)
     ),
     jnp.stack([jnp.arange(10), jnp.arange(10), jnp.arange(10)]),
