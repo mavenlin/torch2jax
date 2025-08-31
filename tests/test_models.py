@@ -2,11 +2,12 @@ import socket
 
 import pytest
 import torch
+from flax import nnx
 from jax import grad, jit, random
 
 from torch2jax import RngPooper, j2t, t2j
 
-from .utils import aac, assert_state_dicts_allclose
+from .utils import aac
 
 
 def test_mlp():
@@ -19,20 +20,20 @@ def test_mlp():
     res_torch = model(j2t(input_batch))
 
     jaxified_module = t2j(model)
-    res_jax = jaxified_module(input_batch, state_dict=params)
-    res_jax_jit = jit(jaxified_module)(input_batch, state_dict=params)
+    res_jax = jaxified_module(input_batch)
+    res_jax_jit = jit(jaxified_module)(input_batch)
 
     # Test forward pass with and without jax.jit
     aac(res_jax, res_torch.numpy(force=True), atol=1e-6)
     aac(res_jax_jit, res_torch.numpy(force=True), atol=1e-6)
 
     # Test gradients
-    jax_grad = grad(lambda p: (jaxified_module(input_batch, state_dict=p) ** 2).sum())(params)
+    jax_grad = nnx.grad(lambda m: (m(input_batch) ** 2).sum())(jaxified_module)["_params"]
 
     res_torch.pow(2).sum().backward()
     torch_grad = {k: v.grad for k, v in model.named_parameters()}
     for k, v in model.named_parameters():
-      aac(jax_grad[k], torch_grad[k], atol=1e-5)
+      aac(jax_grad[k].value, torch_grad[k], atol=1e-5)
 
 
 def is_network_reachable():
@@ -59,25 +60,14 @@ def test_torchvision_models_resnet18():
     if eval:
       model.eval()
 
-    # Copying is necessary since buffers are mutable in training mode
-    parameters = {k: t2j(v) for k, v in model.named_parameters()}
-    buffers = {k: t2j(v).copy() for k, v in model.named_buffers()}
-
     res_torch = model(j2t(input_batch))
-    sd_torch = model.state_dict()
-
     jaxified_module = t2j(model)
-    res_jax, sd_jax = jaxified_module(input_batch, state_dict={**parameters, **buffers}, return_state_dict=True)
-    res_jax_jit, sd_jax_jit = jit(jaxified_module, static_argnames=["return_state_dict"])(
-      input_batch, state_dict={**parameters, **buffers}, return_state_dict=True
-    )
+    res_jax = jaxified_module(input_batch)
+    res_jax_jit = jit(jaxified_module)(input_batch)
 
     # Test forward pass with and without jax.jit
     aac(res_jax, res_torch.numpy(force=True), atol=1e-4)
     aac(res_jax_jit, res_torch.numpy(force=True), atol=1e-4)
-
-    assert_state_dicts_allclose(sd_jax, sd_torch, atol=1e-6)
-    assert_state_dicts_allclose(sd_jax_jit, sd_torch, atol=1e-6)
 
     # Models use different convolution backends and are too deep to compare gradients programmatically. But they line up
     # to reasonable expectations.
@@ -90,15 +80,14 @@ def test_torchvision_models_vit_b_16():
   model = torchvision.models.vit_b_16(weights="DEFAULT")
   model.eval()
 
-  parameters = {k: t2j(v) for k, v in model.named_parameters()}
   assert len(dict(model.named_buffers()).keys()) == 0
 
   input_batch = random.normal(random.PRNGKey(123), (1, 3, 224, 224))
   res_torch = model(j2t(input_batch))
 
   jaxified_module = t2j(model)
-  res_jax = jaxified_module(input_batch, state_dict=parameters)
-  res_jax_jit = jit(jaxified_module)(input_batch, state_dict=parameters)
+  res_jax = jaxified_module(input_batch)
+  res_jax_jit = jit(jaxified_module)(input_batch)
 
   # Test forward pass with and without jax.jit
   aac(res_jax, res_torch.numpy(force=True), atol=1e-1)

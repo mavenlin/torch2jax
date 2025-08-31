@@ -10,6 +10,7 @@ import jax
 import jax.dlpack
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 import torch
 from torch.overrides import TorchFunctionMode, resolve_name
 from torch.utils._pytree import register_pytree_node as torch_register_pytree_node
@@ -1609,66 +1610,65 @@ def j2t_dtype(dtype):
   return next(t_dtype for t_dtype, j_dtype in TJ_DTYPE_ASSOCIATION if j_dtype == dtype)
 
 
-def t2j_module(module):
-  def f(*args, state_dict={}, rng=None, return_state_dict=False):
-    """Call the `torch.nn.Module` `module` with `*args`.
+def t2j_module(module, function_names=None):
+  """Convert a torch.nn.Module to a flax.nnx.Module."""
 
-    Arguments:
-    - `*args`: arguments to pass to the module.
-    - `state_dict`: a dictionary of parameters to use for the module.
-    - `rng`: a `jax.random.PRNGKey` to use for random number generation. Only
-      necessary if the module forward pass uses PyTorch random functions like
-      `torch.randn`.
-    - `return_state_dict`: if `True`, return the updated state dict alongside
-      the output, as in `y, after_sd = f(x, state_dict=before_sd)`. This is
-      useful for modules that involve buffer mutation such as batch norm in
-      training mode. Otherwise, return just the output, as in `y = f(x)`. Note
-      that if you are `jax.jit`ting this function, you'll need to add
-      `static_argnames=["return_state_dict"]` to the jit call.
-    """
-    # We want to have a non-mutating API, so we need to copy the module before performing parameter surgery. Note that
-    # doing this copy in `t2j_module` and outside of `f` is not sufficient: multiple calls to `f` should not step on
-    # each others toes.
-    m = copy.deepcopy(module)
+  class JaxModule(nnx.Module):
+    def __init__(self, torch_module, rngs=None):
+      super().__init__()
+      self.rngs = rngs
+      self._module = torch_module
+      self._params = {name: nnx.Param(t2j(param)) for name, param in torch_module.named_parameters()}
+      self._buffers = {name: nnx.Variable(t2j(buffer)) for name, buffer in torch_module.named_buffers()}
 
-    # Can't use torch.func.functional_call due to https://github.com/pytorch/pytorch/issues/110249
-    assert state_dict.keys() == dict(m.state_dict()).keys()
+    def _prepare(self):
+      m = copy.deepcopy(self._module)
+      torchish_dict = {}
+      reverse_dict = {}
 
-    reverse_dict = {}
+      def visit(m, prefix):
+        for name, param in m.named_parameters(recurse=False):
+          if param in reverse_dict:
+            # sometimes parameters are shared,
+            # e.g. llm head shares embedding weights
+            # we won't be able to get "llm.head" in the state_dict in this case.
+            # because the underlying parameter is only registered once as "embedding.weight".
+            m._parameters[name] = torchish_dict[reverse_dict[param]]
+          else:
+            torchish = Torchish(self._params[".".join(prefix + [name])].value)
+            m._parameters[name] = torchish
+            torchish_dict[".".join(prefix + [name])] = torchish
+            reverse_dict[param] = ".".join(prefix + [name])
 
-    def visit(m, prefix):
-      for name, param in m.named_parameters(recurse=False):
-        if param in reverse_dict:
-          # sometimes parameters are shared,
-          # e.g. llm head shares embedding weights
-          # we won't be able to get "llm.head" in the state_dict in this case.
-          # because the underlying parameter is only registered once as "embedding.weight".
-          m._parameters[name] = Torchish(state_dict[reverse_dict[param]])
-        else:
-          m._parameters[name] = Torchish(state_dict[".".join(prefix + [name])])
-          reverse_dict[param] = ".".join(prefix + [name])
+        for name, buffer in m.named_buffers(recurse=False):
+          # buffers with register_buffer(persistent=False) won't appear in state_dict
+          if ".".join(prefix + [name]) not in module.state_dict().keys():
+            m._buffers[name] = Torchish(t2j(buffer))
+          else:
+            m._buffers[name] = Torchish(self._buffers[".".join(prefix + [name])].value)
 
-      for name, buffer in m.named_buffers(recurse=False):
-        # buffers with register_buffer(persistent=False) won't appear in state_dict
-        if ".".join(prefix + [name]) not in module.state_dict().keys():
-          m._buffers[name] = Torchish(t2j(buffer))
-        else:
-          m._buffers[name] = Torchish(state_dict[".".join(prefix + [name])])
+        # NOTE: named_children() is the non-recursive version of named_modules()
+        for name, child in m.named_children():
+          visit(child, prefix=prefix + [name])
 
-      # NOTE: named_children() is the non-recursive version of named_modules()
-      for name, child in m.named_children():
-        visit(child, prefix=prefix + [name])
+      # Replace parameters with Torchish objects
+      visit(m, prefix=[])
+      return m
 
-    # Replace parameters with Torchish objects
-    visit(m, prefix=[])
+  jax_module = JaxModule(module)
+  if function_names is None:
+    function_names = ["__call__"]
+  if isinstance(function_names, Sequence):
+    for fn in function_names:
 
-    out = t2j_function(m)(*args, rng=rng)
-    if return_state_dict:
-      return out, {k: v.value for k, v in m.state_dict().items()}
-    else:
-      return out
+      def f(self, *args, **kwargs):
+        original_f = getattr(self._prepare(), fn)
+        return t2j_function(original_f)(*args, **kwargs)
 
-  return f
+      setattr(JaxModule, fn, f)
+  else:
+    raise RuntimeError(f"function_names needs to be a list of function names, got {function_names}")
+  return jax_module
 
 
 def t2j(thing):
