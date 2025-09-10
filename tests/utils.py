@@ -33,13 +33,14 @@ def out_kwarg_test(f, args, kwargs={}, **assert_kwargs):
 
   def torch_function(*torch_args):
     out1 = f(*torch_args, **torch_kwargs)
-    out2 = torch.zeros_like(out1)
+    out2 = jax.tree.map(lambda x: torch.zeros_like(x) if isinstance(x, torch.Tensor) else x, out1)
     out3 = f(*torch_args, out=out2, **torch_kwargs)
     return out1, out2, out3
 
   jax_function = t2j(torch_function)
   jax_out1, jax_out2, jax_out3 = jax_function(*args)
-  assert jax_out2 is jax_out3
+  if isinstance(jax_out2, jnp.ndarray):
+    assert jax_out2 is jax_out3
   aac(jax_out1, jax_out3, **assert_kwargs)
 
 

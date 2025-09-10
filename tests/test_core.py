@@ -186,14 +186,15 @@ def test_get_set_item():
   )
 
 
-def test_oneliners():
-  f = [forward_test]
-  fb = f + [backward_test]
-  fbm = fb + [Torchish_member_test]
-  fbo = fb + [out_kwarg_test]
-  fbmo = fbm + [out_kwarg_test]
-  fmo = f + [Torchish_member_test, out_kwarg_test]
+f = [forward_test]
+fb = f + [backward_test]
+fbm = fb + [Torchish_member_test]
+fbo = fb + [out_kwarg_test]
+fbmo = fbm + [out_kwarg_test]
+fmo = f + [Torchish_member_test, out_kwarg_test]
 
+
+def test_oneliners():
   t2j_function_test(lambda x: torch.pow(x, 2), [()], tests=fb)
   t2j_function_test(lambda x: torch.pow(x, 2), [(3,)], tests=fb)
   t2j_function_test(torch.pow, [(), ()], tests=fbmo)
@@ -271,9 +272,18 @@ def test_oneliners():
   t2j_function_test(torch.max, [(3, 5, 7), (3, 5, 7)], atol=1e-6)
   t2j_function_test(torch.max, [(3, 5, 7), (5, 7)], atol=1e-6)  # broadcasting
   t2j_function_test(torch.max, [(3, 5, 7), (7)], atol=1e-6)  # broadcasting
-  t2j_function_test(torch.sort, [(3, 5)], kwargs=dict(dim=0), atol=1e-6)
-  t2j_function_test(torch.sort, [(3, 5)], kwargs=dict(dim=1), atol=1e-6)
-  t2j_function_test(torch.sort, [(3, 5)], kwargs=dict(dim=0, descending=True), atol=1e-6)
+
+
+def test_sort():
+  tests = [forward_test, backward_test, Torchish_member_test, out_kwarg_test]
+  t2j_function_test(torch.sort, [(3, 5)], kwargs=dict(dim=0), atol=1e-6, tests=tests)
+  t2j_function_test(torch.sort, [(3, 5)], kwargs=dict(dim=1), atol=1e-6, tests=tests)
+  t2j_function_test(torch.sort, [(3, 5)], kwargs=dict(dim=0, descending=True), atol=1e-6, tests=tests)
+
+
+def test_topk():
+  f = [forward_test]
+  fb = f + [backward_test]
   t2j_function_test(torch.topk, [(7, 9)], kwargs=dict(k=1, dim=0), atol=1e-6)
   t2j_function_test(torch.topk, [(7, 9)], kwargs=dict(k=2, dim=0), atol=1e-6)
   t2j_function_test(torch.topk, [(7, 9)], kwargs=dict(k=3, dim=0), atol=1e-6)

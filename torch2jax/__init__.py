@@ -275,6 +275,8 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
 
       def func1(*args, out=None, **kwargs):
         if out is not None:
+          # an example of a function that requires a non-array out value is torch.max
+          # where out is a tuple of two tensors.
           ret = func(*args, **kwargs)
           torch_tree_map(assign, out, ret)
           return out
@@ -283,6 +285,8 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
     elif Torchishify_output:
       # although func is jax code, but it is used to mock the torch function, therefore the returning container (if any) should be torch types
       # e.g. torch.return_types.max, therefore, we use torch_tree_map here instead of jax.tree.map
+      # Registration of `torch.return_types` happens only when casting back to Jax. So it could be
+      # unregistered when we call this line
       func1 = lambda *args, **kwargs: torch_tree_map(Torchish, func(*args, **kwargs))
     else:
       func1 = func
@@ -422,20 +426,24 @@ def flatten(input, start_dim=0, end_dim=-1):
 
 
 @implements(torch.max, out_kwarg=True, Torchish_member=True)
-def max(input, *args):
-  if len(args) == 0:  # torch.max(input)
-    return jnp.max(_v(input))
-  if len(args) == 1 and isinstance(args[0], Torchish):  # torch.max(input, other)
-    # if we're comparing two tensors, torch explicitly ask the args[0] to be tensor, passing python float will lead to an error, so we explicitly check for Torchish
-    return jnp.maximum(_v(input), _v(args[0]))
-  # otherwise, torch.max(input, dim, keepdim=False)
-  dim = args[0]
-  keepdim = args[1] if len(args) > 1 else False
-  indices = jnp.argmax(_v(input), axis=dim, keepdims=True)
-  values = jnp.take_along_axis(_v(input), indices, axis=dim)
-  if not keepdim:
-    values, indices = jnp.squeeze(values, axis=dim), jnp.squeeze(indices, axis=dim)
-  return torch.return_types.max([values, indices])
+def max(input, *args, **kwargs):
+  # Overload: torch.max(input, other)
+  if 'other' in kwargs or (args and isinstance(args[0], Torchish)):
+    other = kwargs.get('other', args[0] if args else None)
+    return jnp.maximum(_v(input), _v(other))
+
+  # Overload: torch.max(input, dim, keepdim)
+  if 'dim' in kwargs or (args and not isinstance(args[0], Torchish)):
+    dim = kwargs.get('dim', args[0] if args else None)
+    keepdim = kwargs.get('keepdim', args[1] if len(args) > 1 else False)
+    indices = jnp.argmax(_v(input), axis=dim, keepdims=True)
+    values = jnp.take_along_axis(_v(input), indices, axis=dim)
+    if not keepdim:
+      values, indices = jnp.squeeze(values, axis=dim), jnp.squeeze(indices, axis=dim)
+    return torch.return_types.max([values, indices])
+
+  # Overload: torch.max(input)
+  return jnp.max(_v(input))
 
 
 @implements(torch.mean, Torchish_member=True, out_kwarg=True)
