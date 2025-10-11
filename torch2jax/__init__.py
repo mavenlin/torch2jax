@@ -14,6 +14,11 @@ from torch.overrides import TorchFunctionMode, resolve_name
 from torch.utils._pytree import register_pytree_node as torch_register_pytree_node
 from torch.utils._pytree import tree_map as torch_tree_map
 from torch.utils._pytree import tree_structure as torch_tree_structure
+from .autograd_function import (
+  disable_autograd_function_support as _disable_autograd_function_support,
+  enable_autograd_function_support as _enable_autograd_function_support,
+  init_autograd_function_support as _init_autograd_function_support,
+)
 
 # so that __getitem__ & __setitem__ with mixed keys of int / tensor could work
 torch_register_pytree_node(slice, lambda s: ((s.start, s.stop, s.step), None), lambda values, ctx: slice(*values))
@@ -257,6 +262,24 @@ def _tree_coerce(x):
 def _v(x):
   assert isinstance(x, Torchish)
   return x.value
+
+
+_init_autograd_function_support(Torchish, _tree_coerce)
+_enable_autograd_function_support()
+
+
+def enable_autograd_function_support():
+  """Enable experimental torch.autograd.Function handling.
+
+  This patch is enabled by default when :mod:`torch2jax` is imported. Call this
+  only if you've previously disabled it and want to re-enable support.
+  """
+  _enable_autograd_function_support()
+
+
+def disable_autograd_function_support():
+  """Disable the experimental torch.autograd.Function handling patch."""
+  _disable_autograd_function_support()
 
 
 def _args_to_shape(args):
