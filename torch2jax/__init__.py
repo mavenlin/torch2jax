@@ -1,27 +1,44 @@
 import copy
 import functools
+import os
 from collections import deque
 from contextlib import contextmanager
 from functools import partial
-from typing import Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Literal, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.dlpack
 import jax.numpy as jnp
 import numpy as np
 import torch
+import tempfile
 from torch.overrides import TorchFunctionMode, resolve_name
 from torch.utils._pytree import register_pytree_node as torch_register_pytree_node
 from torch.utils._pytree import tree_map as torch_tree_map
 from torch.utils._pytree import tree_structure as torch_tree_structure
 from .autograd_function import (
-  disable_autograd_function_support as _disable_autograd_function_support,
-  enable_autograd_function_support as _enable_autograd_function_support,
-  init_autograd_function_support as _init_autograd_function_support,
+  enable_autograd_function_support,
+  init_autograd_function_support
+)
+from .triton_bridge import (
+  call_triton_with_jax as _bridge_triton_call,
+  configure_torchish_support as _configure_triton_bridge,
 )
 
 # so that __getitem__ & __setitem__ with mixed keys of int / tensor could work
 torch_register_pytree_node(slice, lambda s: ((s.start, s.stop, s.step), None), lambda values, ctx: slice(*values))
+
+_DEFAULT_TRITON_CACHE_DIR = os.path.join(tempfile.gettempdir(), "triton_cache")
+os.environ["TRITON_CACHE_DIR"] = os.environ.get("TRITON_CACHE_DIR") or _DEFAULT_TRITON_CACHE_DIR
+os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+
+try:
+  from triton import knobs as _triton_knobs  # type: ignore
+
+  if not _triton_knobs.cache.dir:
+    _triton_knobs.cache.dir = os.environ["TRITON_CACHE_DIR"]
+except Exception:
+  pass
 
 
 class RngPooper:
@@ -165,7 +182,9 @@ class Torchish:
   def __setitem__(self, key, value):
     self.value = self.value.at[torch_tree_map(_coerce, key)].set(_coerce(value))
   def __sub__(self, other): return Torchish(self.value - _coerce(other))
-
+  def __truediv__(self, other): return Torchish(self.value / _coerce(other))
+  def __div__(self, other): return Torchish(self.value // _coerce(other))
+  def __hash__(self): return id(self)
   def __or__(self, other): return Torchish(self.value | _coerce(other))
   def __and__(self, other): return Torchish(self.value & _coerce(other))
   def __xor__(self, other): return Torchish(self.value ^ _coerce(other))
@@ -178,6 +197,21 @@ class Torchish:
   def permute(self, *shape): return torch.permute(self, shape)
   def size(self): return self.shape
   def type_as(self, other): return Torchish(jnp.astype(self.value, other.value.dtype))
+  def new_tensor(self, data, dtype=None, device=None, requires_grad=False):
+    if isinstance(data, Torchish):
+      data = data.value
+    arr = jnp.array(data)
+    if dtype is not None:
+      arr = arr.astype(t2j_dtype(dtype))
+    return Torchish(arr)
+  def pow(self, exponent): return Torchish(self.value ** _coerce(exponent))
+  def log(self): return Torchish(jnp.log(self.value))
+  def new_empty(self, *size, dtype=None, device=None, requires_grad=False):
+    if len(size) == 1 and isinstance(size[0], (tuple, list)):
+      size = tuple(size[0])
+    dtype = t2j_dtype(dtype) if dtype is not None else self.value.dtype
+    return Torchish(jnp.empty(size, dtype=dtype))
+  def element_size(self): return jnp.dtype(self.value.dtype).itemsize
   # fmt: on
 
   def view(self, *shape_or_dtype):
@@ -212,6 +246,14 @@ class Torchish:
     return self
 
 
+try:
+  import einops
+
+  einops._backends._type2backend[Torchish] = einops._backends.TorchBackend()
+except ImportError:
+  pass
+
+
 def _coerce(x):
   """Coerce an input into something JAX-compatible.
 
@@ -220,7 +262,7 @@ def _coerce(x):
   JAX-compatible."""
   if isinstance(x, Torchish):
     return x.value
-  elif isinstance(x, (int, float, np.ndarray, jnp.ndarray)):  # jax compatible types
+  elif isinstance(x, (str, int, float, np.ndarray, jnp.ndarray)):  # jax compatible types or static values
     return x
   elif any(x is e for e in (None, Ellipsis)):  # jax compatible special values
     return x
@@ -264,23 +306,14 @@ def _v(x):
   return x.value
 
 
-_init_autograd_function_support(Torchish, _tree_coerce)
-_enable_autograd_function_support()
-
-
-def enable_autograd_function_support():
-  """Enable experimental torch.autograd.Function handling.
-
-  This patch is enabled by default when :mod:`torch2jax` is imported. Call this
-  only if you've previously disabled it and want to re-enable support.
-  """
-  _enable_autograd_function_support()
-
-
-def disable_autograd_function_support():
-  """Disable the experimental torch.autograd.Function handling patch."""
-  _disable_autograd_function_support()
-
+def _contains_torchish(obj):
+  if isinstance(obj, Torchish):
+    return True
+  if isinstance(obj, dict):
+    return any(_contains_torchish(v) for v in obj.values())
+  if isinstance(obj, (list, tuple, set, frozenset)):
+    return any(_contains_torchish(v) for v in obj)
+  return False
 
 def _args_to_shape(args):
   assert len(args) >= 1
@@ -430,6 +463,21 @@ def empty(
   memory_format=torch.contiguous_format,
 ):
   return jnp.empty(_args_to_shape(args), dtype=t2j_dtype(dtype or torch.get_default_dtype()))
+
+
+@implements(torch.empty_like, out_kwarg=True)
+def empty_like(
+  input,
+  dtype=None,
+  layout=None,
+  device=None,
+  requires_grad=False,
+  memory_format=torch.preserve_format,
+):
+  assert layout in (None, torch.strided), "TODO: implement non-strided layouts"
+  assert memory_format in (torch.preserve_format, torch.contiguous_format), "TODO: implement other memory formats"
+  dtype = t2j_dtype(dtype) if dtype is not None else _v(input).dtype
+  return jnp.empty(_v(input).shape, dtype=dtype)
 
 
 @implements(torch.flatten, Torchish_member=True)
@@ -1301,7 +1349,16 @@ def override_Tensor_constructor():
 
 def t2j_function(f):
   def f_jax(*args, rng=None):
-    torch_args = jax.tree.map(Torchish, args)
+    def to_torchish(x):
+      if isinstance(x, Torchish):
+        return x
+      if isinstance(x, jax.Array):
+        return Torchish(x)
+      if isinstance(x, (np.ndarray, jnp.ndarray)):
+        return Torchish(jnp.asarray(x))
+      return x
+
+    torch_args = jax.tree.map(to_torchish, args)
     with override_Tensor_constructor():
       with RngPooperContext(None if rng is None else RngPooper(rng)):
         with TorchishMode():
@@ -1334,6 +1391,108 @@ def t2j_dtype(dtype):
 
 def j2t_dtype(dtype):
   return next(t_dtype for t_dtype, j_dtype in TJ_DTYPE_ASSOCIATION if j_dtype == dtype)
+
+
+_TRITON_PATCHED = False
+_TRITON_POINTER_PLACEHOLDERS = {
+  "cu_seqlens": (jnp.int32, (1,)),
+  "chunk_indices": (jnp.int32, (1,)),
+  "split_offsets": (jnp.int32, (1,)),
+  "g": (jnp.float32, (1,)),
+  "gk": (jnp.float32, (1,)),
+  "gv": (jnp.float32, (1,)),
+  "h0": (jnp.float32, (1,)),
+  "ht": (jnp.float32, (1,)),
+  "residual": (jnp.float32, (1,)),
+  "residual_out": (jnp.float32, (1,)),
+  "mean": (jnp.float32, (1,)),
+  "rstd": (jnp.float32, (1,)),
+  "b": (jnp.float32, (1,)),
+}
+_configure_triton_bridge(
+  torchish_types=(Torchish,),
+  torch_tensor_converter=t2j_array,
+  pointer_placeholders=_TRITON_POINTER_PLACEHOLDERS,
+)
+_TRITON_DEBUG = bool(int(os.environ.get("TORCH2JAX_DEBUG_TRITON", "0")))
+
+def _call_triton_with_jax(kernel_wrapper, grid, args, kwargs):
+  if _TRITON_DEBUG:
+    kernel_name = getattr(kernel_wrapper, "fn", kernel_wrapper)
+    print(f"[torch2jax] Triton raw args={len(args)} kwargs for {kernel_name}: {kwargs}")
+  _bridge_triton_call(
+    kernel_wrapper,
+    grid,
+    args,
+    kwargs,
+    debug=_TRITON_DEBUG,
+  )
+  return None
+
+
+def _maybe_patch_triton():
+  global _TRITON_PATCHED
+  if _TRITON_PATCHED:
+    return
+  try:
+    from triton.runtime.jit import JITFunction
+    from triton.runtime.autotuner import Autotuner
+  except ImportError:
+    return
+  try:
+    import jax_triton  # noqa: F401
+  except ImportError:
+    return
+
+  def wrap_getitem(cls, original_getitem):
+    def new_getitem(self, grid):
+      original_callable = original_getitem(self, grid)
+
+      def call(*args, **kwargs):
+        if _contains_torchish(args) or _contains_torchish(kwargs):
+          return _call_triton_with_jax(self, grid, args, kwargs)
+        return original_callable(*args, **kwargs)
+
+      return call
+
+    return new_getitem
+
+  def wrap_bench(original_bench):
+    def new_bench(self, *args, **kwargs):
+      if _contains_torchish(args) or _contains_torchish(kwargs):
+        return float("inf")
+      return original_bench(self, *args, **kwargs)
+
+    return new_bench
+
+  def wrap_run(original_run):
+    def new_run(self, *args, grid=None, warmup=None, **kwargs):
+      if _contains_torchish(args) or _contains_torchish(kwargs):
+        call_kwargs = dict(kwargs)
+        if grid is None:
+          grid = call_kwargs.pop("grid", None)
+        else:
+          call_kwargs.pop("grid", None)
+        if warmup is None:
+          warmup = call_kwargs.pop("warmup", None)
+        else:
+          call_kwargs.pop("warmup", None)
+        return _call_triton_with_jax(self, grid, args, call_kwargs)
+      if grid is None or warmup is None:
+        return original_run(self, *args, **kwargs)
+      return original_run(self, *args, grid=grid, warmup=warmup, **kwargs)
+
+    return new_run
+
+  JITFunction.__getitem__ = wrap_getitem(JITFunction, JITFunction.__getitem__)
+  JITFunction.run = wrap_run(JITFunction.run)
+  Autotuner.__getitem__ = wrap_getitem(Autotuner, Autotuner.__getitem__)
+  if hasattr(Autotuner, "_bench"):
+    Autotuner._bench = wrap_bench(Autotuner._bench)
+  _TRITON_PATCHED = True
+
+
+_maybe_patch_triton()
 
 
 def t2j_module(module):
@@ -1382,6 +1541,15 @@ def t2j_module(module):
         else:
           m._buffers[name] = Torchish(state_dict[".".join(prefix + [name])])
 
+      # Some modules cache tensors as regular attributes instead of buffers.
+      # Convert those to Torchish so property access (e.g. `.device`) continues
+      # to work under TorchishMode.
+      for attr_name, attr_value in list(vars(m).items()):
+        if attr_name in ("_parameters", "_buffers", "_modules", "_non_persistent_buffers_set"):
+          continue
+        if isinstance(attr_value, torch.Tensor):
+          m.__dict__[attr_name] = Torchish(t2j_array(attr_value))
+
       # NOTE: named_children() is the non-recursive version of named_modules()
       for name, child in m.named_children():
         visit(child, prefix=prefix + [name])
@@ -1420,3 +1588,7 @@ def j2t(thing):
     return j2t_dtype(thing)
   else:
     raise NotImplementedError
+
+
+init_autograd_function_support(Torchish, _tree_coerce)
+enable_autograd_function_support()
