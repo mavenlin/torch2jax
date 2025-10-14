@@ -1394,41 +1394,19 @@ def j2t_dtype(dtype):
 
 
 _TRITON_PATCHED = False
-_TRITON_POINTER_PLACEHOLDERS = {
-  "cu_seqlens": (jnp.int32, (1,)),
-  "chunk_indices": (jnp.int32, (1,)),
-  "split_offsets": (jnp.int32, (1,)),
-  "g": (jnp.float32, (1,)),
-  "gk": (jnp.float32, (1,)),
-  "gv": (jnp.float32, (1,)),
-  "h0": (jnp.float32, (1,)),
-  "ht": (jnp.float32, (1,)),
-  "residual": (jnp.float32, (1,)),
-  "residual_out": (jnp.float32, (1,)),
-  "mean": (jnp.float32, (1,)),
-  "rstd": (jnp.float32, (1,)),
-  "b": (jnp.float32, (1,)),
-}
 _configure_triton_bridge(
-  torchish_types=(Torchish,),
-  torch_tensor_converter=t2j_array,
-  pointer_placeholders=_TRITON_POINTER_PLACEHOLDERS,
+  _torchish=Torchish,
+  _j2t_dtype=j2t_dtype,
 )
 _TRITON_DEBUG = bool(int(os.environ.get("TORCH2JAX_DEBUG_TRITON", "0")))
 
 def _call_triton_with_jax(kernel_wrapper, grid, args, kwargs):
-  if _TRITON_DEBUG:
-    kernel_name = getattr(kernel_wrapper, "fn", kernel_wrapper)
-    print(f"[torch2jax] Triton raw args={len(args)} kwargs for {kernel_name}: {kwargs}")
   _bridge_triton_call(
     kernel_wrapper,
     grid,
     args,
     kwargs,
-    debug=_TRITON_DEBUG,
   )
-  return None
-
 
 def _maybe_patch_triton():
   global _TRITON_PATCHED
