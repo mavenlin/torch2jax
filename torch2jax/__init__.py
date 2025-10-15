@@ -194,6 +194,7 @@ class Torchish:
   def dim(self): return self.ndim
   def float(self): return Torchish(jnp.astype(self.value, jnp.float32))
   def item(self): return self.value.item()
+  def is_inference(self): return torch.is_inference_mode_enabled()
   def permute(self, *shape): return torch.permute(self, shape)
   def size(self): return self.shape
   def type_as(self, other): return Torchish(jnp.astype(self.value, other.value.dtype))
