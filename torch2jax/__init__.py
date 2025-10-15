@@ -225,6 +225,9 @@ class Torchish:
 
     return Torchish(jnp.reshape(self.value, shape_or_dtype))
 
+  def view_as(self, other):
+    return self.view(other.shape)
+
   def to(self, *args, **kwargs):
     # ignore device movement, jax manages its own placement
     if len(args) > 0 and isinstance(args[0], torch.dtype):
@@ -1568,5 +1571,5 @@ def j2t(thing):
     raise NotImplementedError
 
 
-init_autograd_function_support(Torchish, _tree_coerce)
+init_autograd_function_support(Torchish, TorchishMode, _tree_coerce)
 enable_autograd_function_support()

@@ -95,9 +95,10 @@ def call_triton_with_jax(
   call_args = []
   call_kwargs = {}
   array_args_indices = []
+  min_constexpr = min(constexpr_indices)
   for idx, name in enumerate(arg_names):
     arg = args[idx] if idx < len(args) else remaining_kwargs.pop(name, None)
-    if idx in constexpr_indices:
+    if idx >= min_constexpr: # anything beyond this point should be passed as kwargs
       meta_arg = arg if arg is not None else config_defaults.get(name)
       call_kwargs[name] = meta_arg
     elif isinstance(arg, Torchish):
@@ -108,6 +109,8 @@ def call_triton_with_jax(
       call_args.append(jnp.zeros((1,), dtype=jnp.float32))
       torchish_args.append(arg)
       array_args_indices.append(idx)
+    elif isinstance(arg, torch.Tensor):
+      raise ValueError(f"{name} passed to {kernel} is a torch.Tensor")
     else:
       call_args.append(arg)
   # dump all remaining kwargs into the function

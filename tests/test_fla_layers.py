@@ -103,7 +103,7 @@ def test_fla_layers_forward_and_gradients(layer_ctor, input_shape):
 
   jax_output_np, jax_grads = _jax_forward_and_grad(jax_module, jax_input, params_jax, buffers_jax)
 
-  aac(jax_output_np, torch_output_np, atol=1e-3)
+  aac(jax_output_np, torch_output_np, atol=1e-5)
 
   for name, grad_val in jax_grads.items():
     expected = torch_grads[name]
@@ -111,4 +111,4 @@ def test_fla_layers_forward_and_gradients(layer_ctor, input_shape):
     if expected is None:
       assert grad_np is None or np.allclose(grad_np, 0, atol=1e-5)
     else:
-      aac(grad_np, expected, atol=5e-2)
+      aac(grad_np, expected, atol=1e-5)

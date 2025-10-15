@@ -6,58 +6,48 @@ from typing import Any, Callable, Dict, Iterable, Sequence, Tuple
 
 import jax
 import jax.tree_util as jtu
+import torch
 from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
 
-TORCHISH = None
-_TREE_COERCE: Callable = None
+Torchish = None
+_tree_coerce: Callable = None
 _ORIG_APPLY = Function.apply.__func__
 _PATCH_INSTALLED = False
 
 
-def init_autograd_function_support(torchish_cls, tree_coerce: Callable):
+def init_autograd_function_support(torchish_cls, torchish_mode, tree_coerce):
   """Provide the Torchish wrapper and tree coercion helper used by torch2jax."""
-  global _TORCHISH, _TREE_COERCE
-  _TORCHISH = torchish_cls
-  _TREE_COERCE = tree_coerce
+  global Torchish, TorchishMode, _tree_coerce
+  Torchish = torchish_cls
+  TorchishMode = torchish_mode
+  _tree_coerce = tree_coerce
 
 
 def _tree_to_torchish(obj: Any):
   """Convert a pytree of JAX values to Torchish wrappers on demand."""
-  assert _TORCHISH is not None, "init_autograd_function_support must run first"
+  assert Torchish is not None, "init_autograd_function_support must run first"
 
   def convert(x):
-    if isinstance(x, _TORCHISH):
+    if isinstance(x, Torchish):
       return x
     if isinstance(x, jax.Array):
-      return _TORCHISH(x)
+      return Torchish(x)
     return x
 
   return jax.tree.map(convert, obj)
 
 
-class _CapturedCtx(FunctionCtx):
-  _INTERNAL_FIELDS = {
-    "needs_input_grad",
-    "to_save",
-    "non_differentiable",
-    "dirty_tensors",
-  }
-
-  def __init__(self, num_inputs: int):
+class _Ctx(FunctionCtx):
+  def __init__(self):
     super().__init__()
-    self.needs_input_grad = (True,) * num_inputs
-    self.to_save: Tuple[Any, ...] = ()
-    self.non_differentiable: Tuple[Any, ...] = ()
-    self.dirty_tensors: Tuple[Any, ...] = ()
+    # self.attrs = {}
 
   def save_for_backward(self, *tensors):
     super().save_for_backward(*tensors)
-    self.to_save = tensors
 
   def mark_non_differentiable(self, *tensors):
     super().mark_non_differentiable(*tensors)
-    self.non_differentiable = tensors
 
   def mark_dirty(self, *tensors):
     raise NotImplementedError(
@@ -69,76 +59,57 @@ class _CapturedCtx(FunctionCtx):
       "torch2jax does not yet support ctx.set_materialize_grads inside custom autograd.Function"
     )
 
-  def export_state(self):
-    return {
-      "to_save": self.to_save,
-      "non_differentiable": self.non_differentiable,
-      "dirty_tensors": self.dirty_tensors,
-      "needs_input_grad": self.needs_input_grad,
-      "attrs": {
-        name: getattr(self, name)
-        for name in self.__dict__
-        if name not in self._INTERNAL_FIELDS and not name.startswith("_")
-      },
-    }
+  def jax_state(self):
+    return _tree_coerce(self.to_save)
 
-  @classmethod
-  def from_state(cls, num_inputs: int, state):
-    ctx = cls(num_inputs)
-    ctx.needs_input_grad = state["needs_input_grad"]
-    ctx.to_save = tuple(_tree_to_torchish(t) for t in state["to_save"])
-    ctx.non_differentiable = tuple(
-      _tree_to_torchish(t) for t in state["non_differentiable"]
-    )
-    ctx.dirty_tensors = tuple(
-      _tree_to_torchish(t) for t in state["dirty_tensors"]
-    )
-    ctx.saved_tensors = ctx.to_save
-    for name, value in state["attrs"].items():
-      setattr(ctx, name, _tree_to_torchish(value))
-    return ctx
+  def load_state(self, state):
+    self.saved_tensors = _tree_to_torchish(state)
 
 
 def _make_custom_vjp(
   cls: type[Function],
-  arg_count: int,
-  dynamic_indices: Tuple[int],
+  dynamic_entries: Tuple[Tuple[int, Any]],
   static_entries: Tuple[Tuple[int, Any]],
 ) -> Callable[..., Any]:
-  assert _TREE_COERCE is not None
-  tree_coerce = _TREE_COERCE
+  dynamic_args = [v for _, v in dynamic_entries]
+  dynamic_indices = [i for i, _ in dynamic_entries]
+  arg_count = len(dynamic_entries) + len(static_entries)
 
-  def _forward(*dynamic_args):
-    args = [None] * arg_count
+  def _forward(*args):
+    all_args = [None] * arg_count
     for idx, value in static_entries:
-      args[idx] = value
-    for idx, value in zip(dynamic_indices, dynamic_args):
-      args[idx] = value
-    torchish_args = _tree_to_torchish(args)
-    ctx = _CapturedCtx(len(torchish_args))
-    out = cls.forward(ctx, *torchish_args)
-    return tree_coerce(out), tree_coerce(ctx.export_state())
+      all_args[idx] = value
+    for idx, value in zip(dynamic_indices, args):
+      all_args[idx] = value
+    ctx = _Ctx()
+    out = cls.forward(ctx, *_tree_to_torchish(all_args))
+    return _tree_coerce(out), ctx
 
+  # run once to obtain any static ctx
+  _, _ctx = _forward(*map(jax.lax.stop_gradient, dynamic_args))
+
+  # then construct custom vjp function
   @jax.custom_vjp
-  def wrapped(*dynamic_args):
-    out, _ = _forward(*dynamic_args)
+  def wrapped(*args):
+    out, _ = _forward(*args)
     return out
 
-  def fwd(*dynamic_args):
-    out, state = _forward(*dynamic_args)
-    return out, state
+  def fwd(*args):
+    out, ctx = _forward(*args)
+    return out, ctx.jax_state()
 
   def bwd(state, grad_output):
-    ctx = _CapturedCtx.from_state(arg_count, _tree_to_torchish(state))
-    torchish_grad_output = _tree_to_torchish(grad_output)
-    grads = cls.backward(ctx, torchish_grad_output)
+    _ctx.load_state(state)
+    with TorchishMode():
+      if not isinstance(grad_output, (tuple, list)):
+        grad_output = (grad_output,)
+      grads = cls.backward(_ctx, *_tree_to_torchish(grad_output))
     if not isinstance(grads, (tuple, list)):
       grads = (grads,)
-    grads = list(grads)
     dynamic_grads = []
     for idx in dynamic_indices:
       grad = grads[idx] if idx < len(grads) else None
-      dynamic_grads.append(tree_coerce(grad) if grad is not None else None)
+      dynamic_grads.append(_tree_coerce(grad) if grad is not None else None)
     return tuple(dynamic_grads)
 
   wrapped.defvjp(fwd, bwd)
@@ -146,7 +117,7 @@ def _make_custom_vjp(
 
 
 def _is_torchish_arg(values: Iterable[Any]) -> bool:
-  return any(isinstance(v, _TORCHISH) for v in values)
+  return any(isinstance(v, Torchish) for v in values)
 
 
 def _patched_apply(cls, *args, **kwargs):
@@ -157,28 +128,23 @@ def _patched_apply(cls, *args, **kwargs):
   if not _is_torchish_arg(args):
     return _ORIG_APPLY(cls, *args, **kwargs)
 
-  assert _TREE_COERCE is not None
-  tree_coerce = _TREE_COERCE
-  arg_count = len(args)
   static_entries: list[Tuple[int, Any]] = []
-  dynamic_indices: list[int] = []
-  dynamic_values: list[jax.Array] = []
-  args = tree_coerce(args)
+  dynamic_entries: list[Tuple[int, Any]] = []
+  args = _tree_coerce(args)
   for idx, arg in enumerate(args):
     if isinstance(arg, jax.Array):
-      dynamic_indices.append(idx)
-      dynamic_values.append(arg)
+      dynamic_entries.append((idx, arg))
     else:
       static_entries.append((idx, arg))
   # each call it needs to recapture the static values, so we won't cache it
-  custom_vjp = _make_custom_vjp(cls, arg_count, dynamic_indices, static_entries)
-  jax_out = custom_vjp(*dynamic_values)
+  custom_vjp = _make_custom_vjp(cls, dynamic_entries, static_entries)
+  jax_out = custom_vjp(*[v for _, v in dynamic_entries])
   return _tree_to_torchish(jax_out)
 
 
 def enable_autograd_function_support():
   """Install the patched torch.autograd.Function bridge."""
-  assert _TORCHISH is not None and _TREE_COERCE is not None
+  assert Torchish is not None and _tree_coerce is not None
   global _PATCH_INSTALLED
   if not _PATCH_INSTALLED:
     Function.apply = classmethod(_patched_apply)
