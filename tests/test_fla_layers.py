@@ -7,6 +7,7 @@ from jax import grad
 from fla.layers import (
   BasedLinearAttention,
   GatedLinearAttention,
+  KimiDeltaAttention,
   LinearAttention,
   MultiScaleRetention,
 )
@@ -46,11 +47,13 @@ def _torch_forward_and_grad(module, inputs):
     torch_output = torch_output[0]
   loss = torch_output.pow(2).mean()
   loss.backward()
-  grads = {
-    name: (param.grad.detach().cpu().numpy() if param.grad is not None else None)
-    for name, param in module.named_parameters()
-  }
-  return torch_output.detach().cpu().numpy(), grads
+  grads = {}
+  for name, param in module.named_parameters():
+    if param.grad is None:
+      grads[name] = None
+    else:
+      grads[name] = param.grad.detach().cpu().to(torch.float32).numpy()
+  return torch_output.detach().cpu().to(torch.float32).numpy(), grads
 
 
 def _jax_forward_and_grad(jax_module, jax_input, state_dict, param_names):
@@ -135,7 +138,7 @@ def test_fla_layers_forward_and_gradients(layer_ctor, input_shape):
 @CUDA_REQUIRED
 def test_chunk_gated_delta_rule_forward_and_gradients():
   device = torch.device("cuda")
-  dtype = torch.bfloat16
+  dtype = torch.float32
 
   torch.manual_seed(0)
 
@@ -228,3 +231,43 @@ def test_chunk_gated_delta_rule_forward_and_gradients():
       torch_grad,
       atol=5e-3,
     )
+
+
+@CUDA_REQUIRED
+@pytest.mark.parametrize("training", [False, True], ids=["eval", "train"])
+def test_kimi_delta_attention_forward_and_gradients(training):
+  device = torch.device("cuda")
+  dtype = torch.float32
+
+  torch.manual_seed(0)
+  layer = KimiDeltaAttention(
+    hidden_size=32,
+    expand_v=1,
+    head_dim=16,
+    num_heads=2,
+    mode="chunk",
+    use_short_conv=False,
+  ).to(device=device, dtype=dtype)
+  if training:
+    layer.train()
+  else:
+    layer.eval()
+  torch_input = torch.randn(1, 65, 32, device=device, dtype=dtype, requires_grad=True)
+
+  torch_output_np, torch_grads = _torch_forward_and_grad(layer, torch_input)
+  state_dict_torch, param_names = _torch_state_dict_tensors(layer)
+  state_dict_jax = _state_dict_to_jax_tensors(state_dict_torch)
+
+  jax_layer = t2j(layer)
+  jax_input = t2j(torch_input.detach())
+
+  jax_output_np, jax_grads = _jax_forward_and_grad(jax_layer, jax_input, state_dict_jax, param_names)
+
+  aac(jax_output_np.astype(np.float32), torch_output_np.astype(np.float32), atol=1e-5)
+  for name, grad_val in jax_grads.items():
+    expected = torch_grads[name]
+    grad_np = _to_numpy(grad_val)
+    if expected is None:
+      assert grad_np is None or np.allclose(grad_np, 0, atol=1e-5)
+    else:
+      aac(np.asarray(grad_np, dtype=np.float32), expected.astype(np.float32), atol=1e-5)
