@@ -4,7 +4,13 @@ import torch
 import jax.numpy as jnp
 from jax import grad
 
-from fla.layers import LinearAttention, MultiScaleRetention
+from fla.layers import (
+  BasedLinearAttention,
+  GatedLinearAttention,
+  LinearAttention,
+  MultiScaleRetention,
+)
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 from torch2jax import t2j
 
@@ -83,6 +89,16 @@ def _jax_forward_and_grad(jax_module, jax_input, state_dict, param_names):
       (2, 64, 64),
       id="multiscale_retention",
     ),
+    pytest.param(
+      lambda: BasedLinearAttention(hidden_size=64, num_heads=4, num_key_value_heads=4),
+      (2, 64, 64),
+      id="based_linear_attention",
+    ),
+    pytest.param(
+      lambda: GatedLinearAttention(hidden_size=64, num_heads=4, mode="chunk"),
+      (2, 64, 64),
+      id="gated_linear_attention",
+    ),
   ],
 )
 def test_fla_layers_forward_and_gradients(layer_ctor, input_shape):
@@ -114,3 +130,101 @@ def test_fla_layers_forward_and_gradients(layer_ctor, input_shape):
   #     assert grad_np is None or np.allclose(grad_np, 0, atol=1e-5)
   #   else:
   #     aac(grad_np, expected, atol=1e-5)
+
+
+@CUDA_REQUIRED
+def test_chunk_gated_delta_rule_forward_and_gradients():
+  device = torch.device("cuda")
+  dtype = torch.bfloat16
+
+  torch.manual_seed(0)
+
+  batch, seqlen, num_heads, head_dim, value_dim = 1, 8, 2, 4, 4
+
+  q = torch.randn(batch, seqlen, num_heads, head_dim, device=device, dtype=dtype)
+  q.requires_grad_(True)
+
+  k = torch.randn(batch, seqlen, num_heads, head_dim, device=device, dtype=dtype)
+  k.requires_grad_(True)
+
+  v = torch.randn(batch, seqlen, num_heads, value_dim, device=device, dtype=dtype)
+  v.requires_grad_(True)
+
+  g = -torch.rand(batch, seqlen, num_heads, device=device, dtype=dtype)
+  g.requires_grad_(True)
+
+  beta = torch.rand(batch, seqlen, num_heads, device=device, dtype=dtype)
+  beta.requires_grad_(True)
+
+  initial_state = torch.randn(batch, num_heads, head_dim, value_dim, device=device, dtype=dtype)
+  initial_state.requires_grad_(True)
+
+  torch_output, torch_final_state = chunk_gated_delta_rule(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    None,
+    initial_state,
+    True,
+  )
+  loss = torch_output.float().pow(2).mean()
+  loss.backward()
+
+  torch_grads = {
+    "q": q.grad.detach().cpu().to(torch.float32).numpy(),
+    "k": k.grad.detach().cpu().to(torch.float32).numpy(),
+    "v": v.grad.detach().cpu().to(torch.float32).numpy(),
+    "g": g.grad.detach().cpu().to(torch.float32).numpy(),
+    "beta": beta.grad.detach().cpu().to(torch.float32).numpy(),
+    "initial_state": initial_state.grad.detach().cpu().to(torch.float32).numpy(),
+  }
+
+  chunk_fn = t2j(chunk_gated_delta_rule)
+  q_jax, k_jax, v_jax, g_jax, beta_jax, init_state_jax = [
+    t2j(tensor.detach()) for tensor in (q, k, v, g, beta, initial_state)
+  ]
+
+  jax_output, jax_final_state = chunk_fn(
+    q_jax,
+    k_jax,
+    v_jax,
+    g_jax,
+    beta_jax,
+    None,
+    init_state_jax,
+    True,
+  )
+
+  aac(
+    np.asarray(jax_output, dtype=np.float32),
+    _to_numpy(torch_output.detach().float().cpu()),
+    atol=5e-3,
+  )
+  aac(
+    np.asarray(jax_final_state, dtype=np.float32),
+    _to_numpy(torch_final_state.detach().float().cpu()),
+    atol=5e-3,
+  )
+
+  def loss_fn(q, k, v, g, beta, init_state):
+    out, _ = chunk_fn(q, k, v, g, beta, None, init_state, True)
+    out = jnp.asarray(out, dtype=jnp.float32)
+    return jnp.mean(jnp.square(out))
+
+  jax_grads = grad(loss_fn, argnums=(0, 1, 2, 3, 4, 5))(
+    q_jax,
+    k_jax,
+    v_jax,
+    g_jax,
+    beta_jax,
+    init_state_jax,
+  )
+
+  for (name, torch_grad), jax_grad in zip(torch_grads.items(), jax_grads):
+    aac(
+      np.asarray(jax_grad, dtype=np.float32),
+      torch_grad,
+      atol=5e-3,
+    )

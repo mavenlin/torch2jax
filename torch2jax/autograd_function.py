@@ -7,6 +7,9 @@ from typing import Any, Callable, Dict, Iterable, Sequence, Tuple
 import jax
 import jax.tree_util as jtu
 import torch
+import sys
+import types
+import warnings
 from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
 
@@ -14,6 +17,22 @@ Torchish = None
 _tree_coerce: Callable = None
 _ORIG_APPLY = Function.apply.__func__
 _PATCH_INSTALLED = False
+
+
+def _refresh_autograd_function_aliases():
+  """Replace module-level aliases that still point to the original Function.apply."""
+  new_apply = Function.apply
+  with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    for module in list(sys.modules.values()):
+      if module is None or not hasattr(module, "__dict__"):
+        continue
+      attrs = vars(module)
+      for name, value in list(attrs.items()):
+        if isinstance(value, types.MethodType) and value.__func__ is _ORIG_APPLY:
+          cls = value.__self__
+          if isinstance(cls, type) and issubclass(cls, Function):
+            attrs[name] = cls.apply
 
 
 def init_autograd_function_support(torchish_cls, torchish_mode, tree_coerce):
@@ -132,7 +151,12 @@ def _patched_apply(cls, *args, **kwargs):
   dynamic_entries: list[Tuple[int, Any]] = []
   args = _tree_coerce(args)
   for idx, arg in enumerate(args):
-    if isinstance(arg, jax.Array):
+    array_type = getattr(jax, "Array", None)
+    if isinstance(array_type, type) and isinstance(arg, array_type):
+      dynamic_entries.append((idx, arg))
+      continue
+    tracer_type = getattr(jax.core, "Tracer", None)
+    if isinstance(tracer_type, type) and isinstance(arg, tracer_type):
       dynamic_entries.append((idx, arg))
     else:
       static_entries.append((idx, arg))
@@ -148,6 +172,7 @@ def enable_autograd_function_support():
   global _PATCH_INSTALLED
   if not _PATCH_INSTALLED:
     Function.apply = classmethod(_patched_apply)
+    _refresh_autograd_function_aliases()
     _PATCH_INSTALLED = True
 
 

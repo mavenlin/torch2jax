@@ -197,6 +197,33 @@ class Torchish:
   def is_inference(self): return torch.is_inference_mode_enabled()
   def permute(self, *shape): return torch.permute(self, shape)
   def size(self): return self.shape
+  def stride(self, *dims):
+    strides = []
+    stride = 1
+    for dim in reversed(self.shape):
+      strides.append(stride)
+      stride *= dim
+    strides = tuple(reversed(strides))
+    if not dims:
+      return strides
+    if len(dims) == 1 and isinstance(dims[0], (tuple, list)):
+      dims = tuple(dims[0])
+    result = []
+    for dim in dims:
+      idx = dim if dim >= 0 else self.ndim + dim
+      result.append(strides[idx])
+    return tuple(result) if len(result) > 1 else result[0]
+  def squeeze(self, dim=None):
+    if dim is None:
+      return Torchish(jnp.squeeze(self.value))
+    if isinstance(dim, (tuple, list)):
+      axes = [d if d >= 0 else self.ndim + d for d in dim]
+    else:
+      axes = [dim if dim >= 0 else self.ndim + dim]
+    result = self.value
+    for axis in sorted(axes):
+      result = jnp.squeeze(result, axis=axis)
+    return Torchish(result)
   def type_as(self, other): return Torchish(jnp.astype(self.value, other.value.dtype))
   def new_tensor(self, data, dtype=None, device=None, requires_grad=False):
     if isinstance(data, Torchish):
@@ -1181,6 +1208,10 @@ def silu(x, inplace=False):
     return x
   else:
     return Torchish(jax.nn.silu(_v(x)))
+
+@implements(torch.nn.functional.logsigmoid)
+def logsigmoid(x):
+  return jax.nn.log_sigmoid(_v(x))
 
 
 @implements(torch.nn.functional.prelu, Torchish_member=True)

@@ -93,6 +93,7 @@ def call_triton_with_jax(
 
   torchish_args = []
   call_args = []
+  detect_args = []
   call_kwargs = {}
   array_args_indices = []
   min_constexpr = min(constexpr_indices)
@@ -103,22 +104,28 @@ def call_triton_with_jax(
       call_kwargs[name] = meta_arg
     elif isinstance(arg, Torchish):
       call_args.append(arg.value)
+      detect_args.append(arg.value)
       torchish_args.append(arg)
       array_args_indices.append(idx)
     elif arg is None:
-      call_args.append(jnp.zeros((1,), dtype=jnp.float32))
+      placeholder = jnp.zeros((1,), dtype=jnp.float32)
+      call_args.append(placeholder)
+      detect_args.append(placeholder)
       torchish_args.append(arg)
       array_args_indices.append(idx)
     elif isinstance(arg, torch.Tensor):
       raise ValueError(f"{name} passed to {kernel} is a torch.Tensor")
     else:
+      detect_args.append(arg)
+      if isinstance(arg, float):
+        arg = np.float32(arg)
       call_args.append(arg)
   # dump all remaining kwargs into the function
   # call_kwargs.update(remaining_kwargs)
   output_indices, input_output_aliases = _detect_output_indices(
     kernel,
     grid,
-    call_args,
+    detect_args,
     call_kwargs,
     array_args_indices,
   )
@@ -171,18 +178,33 @@ def _scan_pointer_outputs(ttir: str) -> List[int]:
 
   header = header_match.group(1)
   pointer_params: Dict[str, int] = {}
-  for match in re.finditer(r"%arg(\d+):\s*([^,)]+)", header):
-    idx = int(match.group(1))
-    ty = match.group(2).strip()
-    if "!tt.ptr" in ty:
-      pointer_params[f"%arg{idx}"] = idx
+  arg_pattern = re.compile(r"%(?P<name>[A-Za-z0-9_]+):\s*(?P<type>[^,)]+)")
+  for idx, match in enumerate(arg_pattern.finditer(header)):
+    name = match.group("name")
+    ty = match.group("type").strip()
+    if "!tt.ptr" in ty or "!ttg.ptr" in ty:
+      token = f"%{name}"
+      pointer_params[token] = idx
+      # Newer Triton uses argument names (e.g. %q) while older
+      # versions used %arg0. Preserve the legacy alias so either
+      # form can participate in pointer propagation.
+      if name.startswith("arg"):
+        suffix = name[3:]
+        if suffix.isdigit():
+          pointer_params[f"%arg{int(suffix)}"] = idx
 
   pointer_base = dict(pointer_params)
   outputs: set[int] = set()
 
   assign_re = re.compile(r"%(?P<dest>[A-Za-z0-9_]+)\s*=\s*(?P<op>[A-Za-z0-9_.]+)\s*(?P<rest>.*)")
   ssa_token_re = re.compile(r"%[A-Za-z0-9_]+")
-  pointer_ops_without_arrow = {"tt.addptr", "tt.make_tensor_ptr", "tt.make_ptr"}
+  pointer_ops_without_arrow = {
+    "tt.addptr",
+    "tt.make_tensor_ptr",
+    "tt.make_ptr",
+    "ttg.addptr",
+    "ttg.make_tensor_ptr",
+  }
 
   for raw_line in ttir.splitlines():
     line = raw_line.strip()
