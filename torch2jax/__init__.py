@@ -1,14 +1,18 @@
 import copy
 import functools
+import math
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import is_dataclass
+from functools import partial
+from numbers import Integral
 from typing import Literal, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.dlpack
 import jax.numpy as jnp
 import numpy as np
+import einops._backends as einops_backends
 from flax import nnx
 import torch
 from torch.overrides import TorchFunctionMode, resolve_name
@@ -36,6 +40,7 @@ class RngPooper:
 
 
 _RNG_POOPER_STACK = []
+_is_symbolic_dim = getattr(getattr(jax, "export", None), "is_symbolic_dim", lambda x: False)
 
 
 def mk_rng() -> jax.random.PRNGKey:
@@ -78,6 +83,38 @@ def j2t_array(jax_array):
 
   # Alternative, but copying implementation:
   # return torch.from_numpy(jax_array.asnumpy())
+
+
+def t2j_device(device):
+  device = torch.device(device)
+  platform = {"cuda": "gpu", "cpu": "cpu"}.get(device.type)
+  if platform is None:
+    raise NotImplementedError(f"Unsupported torch device type: {device.type}")
+
+  devices = [d for d in jax.devices() if d.platform == platform]
+  if not devices:
+    raise ValueError(f"No JAX devices found for torch device {device}")
+  if device.index is None:
+    return devices[0]
+
+  for jax_device in devices:
+    if getattr(jax_device, "local_hardware_id", None) == device.index or jax_device.id == device.index:
+      return jax_device
+  raise ValueError(f"No JAX device matches torch device {device}")
+
+
+def j2t_device(device):
+  if not isinstance(device, jax.Device):
+    raise TypeError(f"Expected jax.Device, got {type(device)}")
+
+  if device.platform == "cpu":
+    return torch.device("cpu")
+  if device.platform == "gpu":
+    index = getattr(device, "local_hardware_id", None)
+    if index is None:
+      index = device.id
+    return torch.device("cuda", index)
+  raise NotImplementedError(f"Unsupported JAX device platform: {device.platform}")
 
 
 HANDLED_FUNCTIONS = {}
@@ -132,8 +169,9 @@ class Torchish:
     return False
 
   def expand(self, *sizes):
+    sizes = tuple(_coerce(size) for size in sizes)
     assert len(sizes) == self.ndim, "TODO: implement len(sizes) > self.ndim"
-    newshape = [new if new != -1 else old for old, new in zip(self.shape, sizes)]
+    newshape = [old if isinstance(new, Integral) and new == -1 else new for old, new in zip(self.shape, sizes)]
     for i, (old, new) in enumerate(zip(self.shape, sizes)):
       if old != 1:
         assert newshape[i] == old, (
@@ -146,7 +184,11 @@ class Torchish:
   def __add__(self, other): return Torchish(self.value + _coerce(other))
   def __bool__(self): return bool(self.value)
   def __float__(self): return float(self.value)
-  def __getitem__(self, key): return Torchish(self.value.__getitem__(torch_tree_map(_coerce, key)))
+  def __getitem__(self, key):
+    key = torch_tree_map(_coerce, key)
+    if isinstance(key, list):
+      key = tuple(key)
+    return Torchish(self.value.__getitem__(key))
   def __hash__(self): return id(self)  # torch's tensor is also id hashed
   def __int__(self): return int(self.value)
   def __invert__(self): return torch.bitwise_not(self)
@@ -158,11 +200,13 @@ class Torchish:
   def __gt__(self, other): return Torchish(self.value > _coerce(other))
   def __ge__(self, other): return Torchish(self.value >= _coerce(other))
   def __matmul__(self, other): return Torchish(self.value @ _coerce(other))
+  def __mod__(self, other): return Torchish(self.value % _coerce(other))
   def __mul__(self, other): return Torchish(self.value * _coerce(other))
   def __neg__(self): return Torchish(-self.value)
   def __pow__(self, other): return Torchish(self.value ** _coerce(other))
   def __radd__(self, other): return Torchish(_coerce(other) + self.value)
   def __rmatmul__(self, other): return Torchish(_coerce(other) @ self.value)
+  def __rmod__(self, other): return Torchish(_coerce(other) % self.value)
   def __rmul__(self, other): return Torchish(_coerce(other) * self.value)
   def __rsub__(self, other): return Torchish(_coerce(other) - self.value)
   def __setitem__(self, key, value):
@@ -172,8 +216,11 @@ class Torchish:
   def __or__(self, other): return Torchish(self.value | _coerce(other))
   def __and__(self, other): return Torchish(self.value & _coerce(other))
   def __xor__(self, other): return Torchish(self.value ^ _coerce(other))
+  def __lshift__(self, other): return Torchish(self.value << _coerce(other))
+  def __rshift__(self, other): return Torchish(self.value >> _coerce(other))
   # For some reason `foo = torch.foo` doesn't work on these
   def contiguous(self): return self
+  def chunk(self, chunks, dim=0): return torch.chunk(self, chunks, dim=dim)
   def detach(self): return Torchish(jax.lax.stop_gradient(self.value))
   def dim(self): return self.ndim
   def float(self): return Torchish(jnp.astype(self.value, jnp.float32))
@@ -181,21 +228,73 @@ class Torchish:
   def long(self, *args, **kwargs): return Torchish(jnp.astype(self.value, jnp.int64))
   def new_ones(self, *args, **kwargs): return torch.ones(*args, dtype=self.dtype, **kwargs)
   def new_zeros(self, *args, **kwargs): return torch.zeros(*args, dtype=self.dtype, **kwargs)
-  def permute(self, *shape): return torch.permute(self, shape)
+  def permute(self, *shape, **kwargs):
+    if kwargs:
+      assert len(kwargs) == 1 and "dims" in kwargs, f"Unsupported Tensor.permute kwargs: {kwargs}"
+      assert len(shape) == 0, "Cannot pass both dims args and dims kwarg"
+      shape = tuple(kwargs["dims"])
+    if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+      shape = tuple(shape[0])
+    return torch.permute(self, shape)
   def size(self, dim=None): return self.shape if dim is None else self.value.shape[dim]
-  def to(self, *args, **kwargs): return self  # ignore device movement, jax manages its own placement.
+  def split(self, split_size_or_sections, dim=0): return torch.split(self, split_size_or_sections, dim=dim)
+  def tolist(self): return [self[i] for i in range(self.shape[0])] if self.ndim > 0 else self.item()
+  def type(self, dtype=None):
+    if dtype is None:
+      return str(self.dtype)
+    return self.to(dtype=dtype)
+  def to(self, *args, **kwargs):
+    dtype = kwargs.get("dtype", None)
+    if dtype is None:
+      for arg in args:
+        if isinstance(arg, torch.dtype):
+          dtype = arg
+          break
+        if isinstance(arg, Torchish):
+          dtype = j2t_dtype(arg.value.dtype)
+          break
+        if isinstance(arg, jnp.ndarray):
+          dtype = j2t_dtype(arg.dtype)
+          break
+        if isinstance(arg, torch.Tensor):
+          dtype = arg.dtype
+          break
+    if dtype is None:
+      return self  # ignore device movement, jax manages its own placement.
+    return Torchish(jnp.astype(self.value, t2j_dtype(dtype)))
+  def type_as(self, other): return Torchish(jnp.astype(self.value, _coerce(other).dtype))
+  def unflatten(self, dim, sizes):
+    if dim < 0:
+      dim += self.ndim
+    sizes = list(sizes)
+    if sizes.count(-1) > 1:
+      raise ValueError("Only one inferred dimension is allowed in unflatten")
+    if -1 in sizes:
+      inferred = self.shape[dim] // math.prod(size for size in sizes if size != -1)
+      sizes[sizes.index(-1)] = inferred
+    newshape = self.shape[:dim] + tuple(sizes) + self.shape[dim + 1:]
+    return Torchish(jnp.reshape(self.value, newshape))
   # fmt: on
 
-  def view(self, *shape_or_dtype):
+  def view(self, *shape_or_dtype, **kwargs):
+    normalize_shape = lambda shape: tuple(_coerce(dim) for dim in shape)
+
+    if kwargs:
+      assert len(kwargs) == 1 and "shape" in kwargs, f"Unsupported Tensor.view kwargs: {kwargs}"
+      assert len(shape_or_dtype) == 0, "Cannot pass both shape args and shape kwarg"
+      shape_or_dtype = (kwargs["shape"],)
+
     if len(shape_or_dtype) == 1:
       if isinstance(shape_or_dtype[0], Sequence):
-        return Torchish(self.value.reshape(shape_or_dtype[0]))
+        return Torchish(self.value.reshape(normalize_shape(shape_or_dtype[0])))
+      elif isinstance(shape_or_dtype[0], Integral) or _is_symbolic_dim(shape_or_dtype[0]):
+        return Torchish(self.value.reshape((_coerce(shape_or_dtype[0]),)))
       elif isinstance(dtype := shape_or_dtype[0], torch.dtype):
         return Torchish(self.value.view(t2j_dtype(dtype)))
       else:
         raise ValueError(f"Tensor.view takes shape or dtype, got {shape_or_dtype[0]}")
 
-    return Torchish(jnp.reshape(self.value, shape_or_dtype))
+    return Torchish(jnp.reshape(self.value, normalize_shape(shape_or_dtype)))
 
   def to(self, *args, **kwargs):
     # ignore device movement, jax manages its own placement
@@ -217,6 +316,22 @@ class Torchish:
     self.value = jax.random.uniform(mk_rng(), shape=self.shape, dtype=self.value.dtype, minval=a, maxval=b)
     return self
 
+  def repeat(self, *sizes):
+    if len(sizes) == 1 and isinstance(sizes[0], Sequence):
+      sizes = tuple(_coerce(size) for size in sizes[0])
+    else:
+      sizes = tuple(_coerce(size) for size in sizes)
+    return Torchish(jnp.tile(self.value, sizes))
+
+  def repeat_interleave(self, repeats, dim=None):
+    repeats = _coerce(repeats) if isinstance(repeats, Torchish) else repeats
+    return Torchish(jnp.repeat(self.value, repeats, axis=dim))
+
+
+if "torch" not in einops_backends._loaded_backends:
+  einops_backends._loaded_backends["torch"] = einops_backends.TorchBackend()
+einops_backends._type2backend[Torchish] = einops_backends._loaded_backends["torch"]
+
 
 def _coerce(x):
   """Coerce an input into something JAX-compatible.
@@ -226,7 +341,9 @@ def _coerce(x):
   JAX-compatible."""
   if isinstance(x, Torchish):
     return x.value
-  elif isinstance(x, (int, float, np.ndarray, jnp.ndarray)):  # jax compatible types
+  elif isinstance(x, (int, float, np.integer, np.floating, np.ndarray, jnp.ndarray)) or _is_symbolic_dim(x):  # jax compatible types
+    return x
+  elif x is Ellipsis:
     return x
   elif any(x is e for e in (None, Ellipsis)):  # jax compatible special values
     return x
@@ -274,7 +391,7 @@ def _v(x):
 
 def _args_to_shape(args):
   assert len(args) >= 1
-  return args if isinstance(args[0], int) else args[0]
+  return args if isinstance(args[0], int) or _is_symbolic_dim(args[0]) else args[0]
 
 
 def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchish_member=False):
@@ -338,18 +455,37 @@ def auto_implements(
 
 auto_implements(torch.abs, jnp.abs, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.add, jnp.add, out_kwarg=True, Torchish_member=True)
-auto_implements(torch.bitwise_not, jnp.invert, out_kwarg=True, Torchish_member=True)
+
+
+@implements(torch.clamp, out_kwarg=True, Torchish_member=True)
+def clamp(input, min=None, max=None):
+  x = _v(input)
+  if min is not None:
+    x = jnp.maximum(x, _coerce(min))
+  if max is not None:
+    x = jnp.minimum(x, _coerce(max))
+  return x
+
+
 auto_implements(torch.cos, jnp.cos, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.clone, lambda x: x, Torchish_member=True)  # jax arrays are immutable, no copy needed
 auto_implements(torch.div, jnp.divide, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.exp, jnp.exp, out_kwarg=True, Torchish_member=True)
-auto_implements(torch.nn.functional.gelu, jax.nn.gelu)
-auto_implements(torch.logical_and, jnp.logical_and, out_kwarg=True, Torchish_member=True)
-auto_implements(torch.logical_or, jnp.logical_or, out_kwarg=True, Torchish_member=True)
-auto_implements(torch.logical_not, jnp.logical_not, out_kwarg=True, Torchish_member=True)
-auto_implements(torch.logical_xor, jnp.logical_xor, out_kwarg=True, Torchish_member=True)
+
+
+@implements(torch.nn.functional.gelu)
+def gelu(input, approximate="none"):
+  if approximate == "none":
+    return jax.nn.gelu(_v(input), approximate=False)
+  if approximate == "tanh":
+    return jax.nn.gelu(_v(input), approximate=True)
+  raise NotImplementedError(f"Unsupported GELU approximation mode: {approximate}")
+
+
+auto_implements(torch.matmul, jnp.matmul, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.mul, jnp.multiply, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.nan_to_num, jnp.nan_to_num, out_kwarg=True, Torchish_member=True)
+auto_implements(torch.outer, jnp.outer, out_kwarg=True, Torchish_member=True)
 # Tensor.permute has a different signature than torch.permute
 auto_implements(torch.permute, jnp.transpose, dont_coerce_argnums=(1, 2))  # TODO: do we need argnum 2?
 auto_implements(torch.pow, jnp.power, out_kwarg=True, Torchish_member=True)
@@ -419,6 +555,30 @@ def cat(tensors, dim=0):
   return jnp.concatenate([_v(x) for x in tensors], axis=dim)
 
 
+@implements(torch.chunk, Torchishify_output=False)
+def chunk(input, chunks, dim=0):
+  pieces = jnp.array_split(_v(input), chunks, axis=dim)
+  return tuple(Torchish(piece) for piece in pieces)
+
+
+@implements(torch.split, Torchishify_output=False)
+def split(input, split_size_or_sections, dim=0):
+  x = _v(input)
+  if isinstance(split_size_or_sections, Sequence):
+    boundaries = np.cumsum(split_size_or_sections)[:-1]
+    pieces = jnp.split(x, boundaries, axis=dim)
+  else:
+    size = x.shape[dim]
+    sections = list(range(split_size_or_sections, size, split_size_or_sections))
+    pieces = jnp.split(x, sections, axis=dim)
+  return tuple(Torchish(piece) for piece in pieces)
+
+
+@implements(torch.stack, out_kwarg=True)
+def stack(tensors, dim=0):
+  return jnp.stack([_v(x) for x in tensors], axis=dim)
+
+
 @implements(torch.cumsum, out_kwarg=True, Torchish_member=True)
 def cumsum(input, dim, *, dtype=None):
   if dtype is not None:
@@ -468,6 +628,41 @@ def full(size, fill_value, *, out=None, dtype=None, layout=torch.strided, device
     return Torchish(jax_out)
 
 
+@implements(torch.full_like, Torchishify_output=False)
+def full_like(
+  input,
+  fill_value,
+  *,
+  dtype=None,
+  layout=torch.strided,
+  device=None,
+  requires_grad=False,
+  memory_format=torch.preserve_format,
+):
+  assert not requires_grad
+  del layout, device, memory_format
+  x = _v(input)
+  out_dtype = x.dtype if dtype is None else t2j_dtype(dtype)
+  return Torchish(jnp.full(x.shape, fill_value, dtype=out_dtype))
+
+
+@implements(torch.empty_like, out_kwarg=True)
+def empty_like(
+  input,
+  *,
+  dtype=None,
+  layout=torch.strided,
+  device=None,
+  requires_grad=False,
+  memory_format=torch.preserve_format,
+):
+  assert not requires_grad
+  del layout, device, memory_format
+  x = _v(input)
+  out_dtype = x.dtype if dtype is None else t2j_dtype(dtype)
+  return jnp.empty(x.shape, dtype=out_dtype)
+
+
 @implements(torch.isin)
 def isin(elements, test_elements, *, assume_unique=False, invert=False):
   return jnp.isin(_v(elements), _v(test_elements), assume_unique, invert)
@@ -498,6 +693,11 @@ def logical_xor(input, other):
   return jnp.logical_xor(_v(input), _v(other))
 
 
+@implements(torch.log, out_kwarg=True, Torchish_member=True)
+def log(input):
+  return jnp.log(_v(input))
+
+
 @implements(torch.masked_fill, Torchish_member=True)
 def masked_fill(self, mask, value):
   mask, value = _v(mask), _coerce(value)
@@ -517,10 +717,34 @@ def max(input, dim=None, keepdim=False):
   return torch.return_types.max([values, indices])
 
 
+@implements(torch.min, out_kwarg=True, Torchish_member=True)
+def min(input, other=None, dim=None, keepdim=False):
+  if other is not None:
+    return jnp.minimum(_v(input), _v(other))
+  if dim is None:
+    return jnp.min(_v(input))
+  indices = jnp.argmin(_v(input), axis=dim, keepdims=True)
+  values = jnp.take_along_axis(_v(input), indices, axis=dim)
+  if not keepdim:
+    values = jnp.squeeze(values, axis=dim)
+    indices = jnp.squeeze(indices, axis=dim)
+  return torch.return_types.min([values, indices])
+
+
 @implements(torch.mean, out_kwarg=True, Torchish_member=True)
 def mean(input, dim=None, keepdim=False, dtype=None):
   dtype = t2j_dtype(dtype) if dtype is not None else None
   return jnp.mean(_v(input), axis=dim, keepdims=keepdim, dtype=dtype)
+
+
+@implements(torch.norm, out_kwarg=True, Torchish_member=True)
+def norm(input, p="fro", dim=None, keepdim=False, out=None, dtype=None):
+  assert out is None, "TODO: implement out argument"
+  x = _v(input)
+  if dtype is not None:
+    x = jnp.astype(x, t2j_dtype(dtype))
+  ord_ = 2 if p == "fro" else p
+  return jnp.linalg.norm(x, ord=ord_, axis=dim, keepdims=keepdim)
 
 
 @implements(torch.multinomial, out_kwarg=True, Torchish_member=True)
@@ -598,6 +822,13 @@ def ones_like(
 ):
   assert not requires_grad
   return jnp.ones_like(_v(input), dtype=t2j_dtype(dtype or input.dtype))
+
+
+@implements(torch.where, out_kwarg=True)
+def where(condition, input=None, other=None):
+  if input is None and other is None:
+    return jnp.where(_v(condition))
+  return jnp.where(_v(condition), _v(input), _v(other))
 
 
 @implements(torch.poisson)
@@ -755,9 +986,10 @@ def scatter_add(input, dim, index, src):
 def softmax(input, dim, *, dtype=None):
   if dim is None:
     dim = -1
-  output = jax.nn.softmax(_v(input), axis=dim)
+  x = _v(input)
   if dtype is not None:
-    output = jnp.astype(output, t2j_dtype(dtype))
+    x = jnp.astype(x, t2j_dtype(dtype))
+  output = jax.nn.softmax(x, axis=dim)
   return output
 
 
@@ -816,6 +1048,8 @@ def topk(input, k, dim=None, largest=True, sorted=True):
 
 @implements(torch.unbind, Torchishify_output=False, Torchish_member=True)
 def unbind(input, dim=0) -> Sequence[Torchish]:
+  if dim < 0:
+    dim += input.ndim
   return tuple(Torchish(input.value[(slice(None),) * dim + (i,)]) for i in range(input.value.shape[dim]))
 
 
@@ -922,9 +1156,43 @@ def conv2d(
     padding=padding,
     rhs_dilation=dilation,
     feature_group_count=groups,
+    precision=jax.lax.Precision.HIGH,
   )
   if bias is not None:
     res += _v(bias)[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
+  return res
+
+
+@implements(torch.nn.functional.conv3d)
+def conv3d(
+  input,
+  weight,
+  bias=None,
+  stride=1,
+  padding: Union[int, Tuple[int, int, int], Literal["same", "valid"]] = 0,
+  dilation=1,
+  groups=1,
+):
+  if isinstance(stride, int): stride = (stride,) * 3
+  if isinstance(padding, int):
+    padding = [(padding, padding)] * 3
+  elif isinstance(padding, tuple):
+    p1, p2, p3 = padding
+    padding = [(p1, p1), (p2, p2), (p3, p3)]
+  if isinstance(dilation, int): dilation = (dilation,) * 3
+
+  res = jax.lax.conv_general_dilated(
+    lhs=_v(input),
+    rhs=_v(weight),
+    window_strides=stride,
+    padding=padding,
+    rhs_dilation=dilation,
+    dimension_numbers=("NCDHW", "OIDHW", "NCDHW"),
+    feature_group_count=groups,
+    precision=jax.lax.Precision.HIGH,
+  )
+  if bias is not None:
+    res += _v(bias)[jnp.newaxis, :, jnp.newaxis, jnp.newaxis, jnp.newaxis]
   return res
 
 
@@ -952,6 +1220,7 @@ def conv_transpose2d(
     output_padding=output_padding,
     dilation=dilation,
     dimension_numbers=("NCHW", "OIHW", "NCHW"),
+    precision=jax.lax.Precision.HIGH,
   )
   if bias is not None:
     res += _v(bias)[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]
@@ -1266,12 +1535,60 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-05):
   return res
 
 
+@implements(torch.nn.functional.rms_norm)
+def rms_norm(input, normalized_shape, weight=None, eps=1e-05):
+  input = _v(input)
+  eps = 1e-05 if eps is None else eps
+
+  d = len(normalized_shape)
+  mean_square = jnp.mean(
+    jnp.square(input),
+    axis=tuple(range(input.ndim)[-d:]),
+    keepdims=True,
+  )
+  res = input * jax.lax.rsqrt(mean_square + eps)
+  if weight is not None:
+    res *= _v(weight)
+  return res
+
+
+@implements(torch.nn.functional.group_norm)
+def group_norm(input, num_groups, weight=None, bias=None, eps=1e-05):
+  x = _v(input)
+  assert x.ndim >= 2, "group_norm expects at least (N, C, ...)"
+  assert x.shape[1] % num_groups == 0, "num_channels must be divisible by num_groups"
+
+  channels_per_group = x.shape[1] // num_groups
+  grouped = jnp.reshape(x, (x.shape[0], num_groups, channels_per_group, *x.shape[2:]))
+  reduce_axes = tuple(range(2, grouped.ndim))
+  mean = jnp.mean(grouped, axis=reduce_axes, keepdims=True)
+  var = jnp.var(grouped, axis=reduce_axes, keepdims=True, ddof=0)
+  grouped = (grouped - mean) / jnp.sqrt(var + eps)
+  res = jnp.reshape(grouped, x.shape)
+
+  newshape = (1, -1) + (1,) * (x.ndim - 2)
+  if weight is not None:
+    res *= _v(weight).reshape(newshape)
+  if bias is not None:
+    res += _v(bias).reshape(newshape)
+  return res
+
+
 @implements(torch.nn.functional.linear)
 def linear(input, weight, bias=None):
   if bias is None:
     return _v(input) @ _v(weight).T
   else:
     return _v(input) @ _v(weight).T + _v(bias)
+
+
+@implements(torch.nn.functional.normalize)
+def normalize(input, p=2.0, dim=1, eps=1e-12, out=None):
+  assert out is None, "TODO: implement out argument"
+  x = _v(input)
+  norm = jnp.linalg.norm(x, ord=p, axis=dim, keepdims=True)
+  norm = jnp.maximum(norm, eps)
+  return x / norm
 
 
 @implements(torch.nn.functional.max_pool1d)
@@ -1324,6 +1641,60 @@ def max_pool2d(
     window_strides=(1, 1, stride, stride) if isinstance(stride, int) else (1, 1) + stride,
     padding=[(0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)],
   )
+
+
+@implements(torch.nn.functional.avg_pool3d)
+def avg_pool3d(
+  input,
+  kernel_size,
+  stride=None,
+  padding=0,
+  ceil_mode=False,
+  count_include_pad=True,
+  divisor_override=None,
+):
+  assert input.ndim == 5, "TODO: implement non-batched input"
+  assert not ceil_mode, "TODO: implement ceil_mode"
+  assert count_include_pad, "TODO: implement count_include_pad=False"
+  assert divisor_override is None, "TODO: implement divisor_override"
+
+  if stride is None:
+    stride = kernel_size
+  if isinstance(kernel_size, int):
+    kernel_size = (kernel_size, kernel_size, kernel_size)
+  if isinstance(stride, int):
+    stride = (stride, stride, stride)
+  if isinstance(padding, int):
+    padding = (padding, padding, padding)
+
+  (pad_t, pad_h, pad_w) = padding
+  pooled = jax.lax.reduce_window(
+    _v(input),
+    0.0,
+    jax.lax.add,
+    window_dimensions=(1, 1) + kernel_size,
+    window_strides=(1, 1) + stride,
+    padding=[(0, 0), (0, 0), (pad_t, pad_t), (pad_h, pad_h), (pad_w, pad_w)],
+  )
+  return pooled / float(np.prod(kernel_size))
+
+
+@implements(torch.nn.functional.pad)
+def pad(input, pad, mode="constant", value=None):
+  assert mode == "constant", "TODO: implement non-constant pad modes"
+  x = _v(input)
+  assert len(pad) % 2 == 0, "pad must have even length"
+  assert len(pad) <= 2 * x.ndim, "pad tuple is too long for input rank"
+
+  pad_width = [(0, 0)] * x.ndim
+  num_padded_dims = len(pad) // 2
+  for i in range(num_padded_dims):
+    left = pad[2 * i]
+    right = pad[2 * i + 1]
+    pad_width[-(i + 1)] = (left, right)
+
+  constant_values = 0 if value is None else value
+  return jnp.pad(x, pad_width, mode="constant", constant_values=constant_values)
 
 
 @implements(torch.nn.functional.relu, Torchishify_output=False, Torchish_member=True)
@@ -1581,13 +1952,24 @@ def override_Tensor_constructor():
     torch.Tensor.__new__ = original_new
 
 
+@contextmanager
+def override_torch_constructors():
+  original_arange, original_zeros = torch.arange, torch.zeros
+  torch.arange, torch.zeros = HANDLED_FUNCTIONS[torch.arange], HANDLED_FUNCTIONS[torch.zeros]
+  try:
+    yield
+  finally:
+    torch.arange, torch.zeros = original_arange, original_zeros
+
 def t2j_function(f):
-  def f_jax(*args, rng=None):
+  def f_jax(*args, rng=None, **kwargs):
     torch_args = jax.tree.map(Torchish, args)
+    torch_kwargs = jax.tree.map(Torchish, kwargs)
     with override_Tensor_constructor():
-      with RngPooperContext(None if rng is None else RngPooper(rng)):
-        with TorchishMode():
-          out = f(*torch_args)
+      with override_torch_constructors():
+        with RngPooperContext(None if rng is None else RngPooper(rng)):
+          with TorchishMode():
+            out = f(*torch_args, **torch_kwargs)
     # use the torch's tree_map, because out is generated from torch code
     return _tree_coerce(out)
 
@@ -1626,8 +2008,8 @@ def t2j_module(module, function_names=None):
       super().__init__()
       self.rngs = rngs
       self._module = torch_module
-      self._params = {name: nnx.Param(t2j(param)) for name, param in torch_module.named_parameters()}
-      self._buffers = {name: nnx.Variable(t2j(buffer)) for name, buffer in torch_module.named_buffers()}
+      self._params = nnx.Dict({name: nnx.Param(t2j(param)) for name, param in torch_module.named_parameters()})
+      self._buffers = nnx.Dict({name: nnx.Variable(t2j(buffer)) for name, buffer in torch_module.named_buffers()})
 
     def _prepare(self):
       m = copy.deepcopy(self._module)
@@ -1669,8 +2051,8 @@ def t2j_module(module, function_names=None):
   if isinstance(function_names, Sequence):
     for fn in function_names:
 
-      def f(self, *args, **kwargs):
-        original_f = getattr(self._prepare(), fn)
+      def f(self, *args, _fn=fn, **kwargs):
+        original_f = getattr(self._prepare(), _fn)
         return t2j_function(original_f)(*args, **kwargs)
 
       setattr(JaxModule, fn, f)
@@ -1684,6 +2066,8 @@ def t2j(thing):
     return t2j_array(thing)
   elif isinstance(thing, torch.nn.Module):
     return t2j_module(thing)
+  elif isinstance(thing, torch.device):
+    return t2j_device(thing)
   elif isinstance(thing, torch.dtype):
     return t2j_dtype(thing)
   elif callable(thing):
@@ -1696,6 +2080,8 @@ def t2j(thing):
 def j2t(thing):
   if isinstance(thing, jnp.ndarray):
     return j2t_array(thing)
+  if isinstance(thing, jax.Device):
+    return j2t_device(thing)
   # We allow dtypes and "dtype constructors". It's subtle, but there's a difference. See https://github.com/jax-ml/jax/discussions/25497.
   if isinstance(thing, jnp.dtype) or thing in [dt for _, dt in TJ_DTYPE_ASSOCIATION]:
     return j2t_dtype(thing)

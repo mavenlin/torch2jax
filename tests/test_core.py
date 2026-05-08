@@ -6,10 +6,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from einops import rearrange
 from jax import grad, jit, random, vmap
-
-from torch2jax import t2j
-
+from torch2jax import j2t, t2j
 from .utils import Torchish_member_test, aac, backward_test, forward_test, out_kwarg_test, t2j_function_test
 
 
@@ -199,6 +198,58 @@ def test_get_set_item():
     [(3, 4, 5), ()],
     tests=tests_nojit,
   )
+  t2j_function_test(
+    lambda x: x.__getitem__([torch.tensor([1, 2]), slice(None), torch.tensor([2, 3])]), [(3, 4, 5)], tests=tests
+  )
+
+
+def test_devices():
+  assert t2j(torch.device("cpu")) == jax.devices("cpu")[0]
+  assert j2t(jax.devices("cpu")[0]) == torch.device("cpu")
+  if torch.cuda.is_available() and any(d.platform == "gpu" for d in jax.devices()):
+    assert j2t(t2j(torch.device("cuda:0"))) == torch.device("cuda", 0)
+
+
+def test_t2j_function_kwargs_and_einops():
+  fb = [forward_test, backward_test]
+  t2j_function_test(lambda x, y=None: x + y, [(3,)], kwargs=dict(y=jnp.arange(3.0)), tests=fb)
+  t2j_function_test(lambda x: rearrange(x, "b c h w -> b h (c w)"), [(2, 3, 4, 5)], tests=fb)
+
+
+def test_symbolic_export():
+  b, t = jax.export.symbolic_shape("b, t", constraints=("b >= 1", "t >= 1"))
+  f = jax.export.export(jit(t2j(lambda x: x.permute(0, 2, 1, 3).reshape(shape=(x.shape[0], x.shape[2], -1)))))(
+    jax.ShapeDtypeStruct((b, 3, t, 4), jnp.float32)
+  )
+  assert f.in_avals == (jax.core.ShapedArray((b, 3, t, 4), jnp.float32),)
+  assert f.out_avals == (jax.core.ShapedArray((b, t, 12), jnp.float32),)
+
+
+def test_symbolic_export_constructors():
+  b, t = jax.export.symbolic_shape("b, t", constraints=("b >= 1", "t >= 1"))
+  f = jax.export.export(
+    jit(
+      t2j(
+        lambda x: (
+          torch.arange(0, x.shape[0], dtype=torch.int32).reshape(shape=(x.shape[0], 1)).repeat([1, x.shape[1]])
+          + torch.zeros(x.shape[0], x.shape[1], dtype=torch.int32)
+        )
+      )
+    )
+  )(jax.ShapeDtypeStruct((b, t), jnp.float32))
+  assert f.in_avals == (jax.core.ShapedArray((b, t), jnp.float32),)
+  assert f.out_avals == (jax.core.ShapedArray((b, t), jnp.int32),)
+
+
+def test_constructor_monkey_patch():
+  aac(
+    t2j(lambda x: torch.arange(0, x.shape[0], dtype=torch.int32))(jnp.ones((5,), dtype=jnp.float32)),
+    jnp.arange(5, dtype=jnp.int32),
+  )
+  aac(
+    t2j(lambda x: torch.zeros(x.shape[0], 3, dtype=torch.float32))(jnp.ones((5,), dtype=jnp.float32)),
+    jnp.zeros((5, 3), dtype=jnp.float32),
+  )
 
 
 def test_oneliners():
@@ -276,6 +327,18 @@ def test_oneliners():
   t2j_function_test(torch.logical_not, [(3, 2)], samplers=[random.bernoulli], tests=fmo)
   t2j_function_test(torch.logical_not, [(2)], samplers=[random.bernoulli], tests=fmo)
   t2j_function_test(torch.logical_not, [(3, 1)], samplers=[random.bernoulli], tests=fmo)
+  t2j_function_test(
+    lambda x: x << 1, [(3, 5)], samplers=[lambda key, shape: random.randint(key, shape, minval=1, maxval=8)], tests=f
+  )
+  t2j_function_test(
+    lambda x: x >> 1, [(3, 5)], samplers=[lambda key, shape: random.randint(key, shape, minval=1, maxval=8)], tests=f
+  )
+  t2j_function_test(
+    lambda x: x % 3, [(3, 5)], samplers=[lambda key, shape: random.randint(key, shape, minval=1, maxval=8)], tests=f
+  )
+  t2j_function_test(
+    lambda x: 7 % x, [(3, 5)], samplers=[lambda key, shape: random.randint(key, shape, minval=1, maxval=8)], tests=f
+  )
 
   # masked_fill
   samplers = [random.normal, random.bernoulli, random.normal]
@@ -294,6 +357,9 @@ def test_oneliners():
   t2j_function_test(torch.max, [(3, 5, 7)], kwargs=dict(dim=0, keepdim=False), atol=1e-6)
   t2j_function_test(torch.max, [(3, 5, 7)], kwargs=dict(dim=1, keepdim=False), atol=1e-6)
   t2j_function_test(torch.max, [(3, 5, 7)], kwargs=dict(dim=2, keepdim=False), atol=1e-6)
+  t2j_function_test(torch.min, [(3, 5)], tests=fmo)
+  t2j_function_test(torch.min, [(3, 5)], kwargs=dict(dim=1), tests=f)
+  t2j_function_test(lambda x, y: torch.min(x, y), [(3, 5), (3, 5)], tests=fbmo)
   t2j_function_test(torch.mean, [(3, 5)], atol=1e-6, tests=fbmo)
   t2j_function_test(torch.mean, [(3, 5)], kwargs=dict(dim=1), atol=1e-6, tests=fbmo)
   t2j_function_test(torch.sigmoid, [(3,)], atol=1e-6, tests=fbmo)
@@ -333,6 +399,7 @@ def test_oneliners():
   t2j_function_test(lambda x: x.view(2, 2) @ x.view(2, 2).T, [(4,)], rtol=1e-6, tests=fb)
   t2j_function_test(lambda x: x.view(3, 4), [(12,)], tests=fb)
   t2j_function_test(lambda x: x.view(3, 4), [(4, 3)], tests=fb)
+  t2j_function_test(lambda x: x.view(shape=(3, 4)), [(12,)], tests=fb)
 
   # view with tuple input
   t2j_function_test(lambda x: x.view((2, 2)) @ x.view((2, 2)), [(2, 2)], rtol=1e-6, tests=fb)
@@ -363,8 +430,12 @@ def test_oneliners():
   t2j_function_test(lambda x: x.permute(1, 0), [(4, 3)], tests=fb)
   t2j_function_test(lambda x: x.permute(1, 0, 2), [(4, 3, 2)], tests=fb)
   t2j_function_test(lambda x: x.permute(2, 0, 1), [(4, 3, 2)], tests=fb)
+  t2j_function_test(lambda x: x.permute(dims=(2, 0, 1)), [(4, 3, 2)], tests=fb)
 
   t2j_function_test(lambda x: x.expand(5, -1, -1), [(1, 3, 2)], tests=fb)
+  t2j_function_test(lambda x: x.unflatten(1, (2, -1)), [(3, 8)], tests=fb)
+  t2j_function_test(lambda x: x.repeat(2, 1), [(3, 5)], tests=fb)
+  t2j_function_test(lambda x: x.repeat_interleave(np.int64(2), dim=np.int64(1)), [(3, 5)], tests=fb)
 
   t2j_function_test(lambda x: torch.transpose(x, 0, 1), [(2, 3)], tests=fb)
   t2j_function_test(lambda x: torch.transpose(x, 0, 2), [(2, 3, 5)], tests=fb)
@@ -372,6 +443,7 @@ def test_oneliners():
 
   t2j_function_test(lambda x, y, out=None: torch.cat((x, y), out=out), [(2, 3), (5, 3)], tests=fbo)
   t2j_function_test(lambda x, y, out=None: torch.cat((x, y), dim=-1, out=out), [(2, 3), (2, 5)], tests=fbo)
+  t2j_function_test(lambda x, y, out=None: torch.stack((x, y), dim=1, out=out), [(3,), (3,)], tests=fbo)
 
   t2j_function_test(torch.flatten, [(2, 3, 5)], tests=fbm)
   t2j_function_test(torch.flatten, [(2, 3, 5)], kwargs=dict(start_dim=1), tests=fbm)
@@ -390,7 +462,28 @@ def test_oneliners():
   t2j_function_test(lambda x: x != x, [(3,)], tests=f)
 
   t2j_function_test(torch.abs, [(3,)], tests=fbmo)
+  t2j_function_test(lambda x: torch.clamp(x, min=np.float32(-0.5), max=np.float64(0.5)), [(3, 5)], tests=fb)
+  t2j_function_test(lambda x: torch.nn.functional.gelu(x, approximate="tanh"), [(3, 5)], tests=fb)
+  t2j_function_test(lambda x, y: torch.outer(x, y), [(3,), (5,)], tests=fbmo)
+  t2j_function_test(lambda x: torch.log(torch.exp(x)), [(3, 5)], tests=fbmo)
+  t2j_function_test(
+    lambda c, x, y: torch.where(c, x, y),
+    [(3, 5), (3, 5), (3, 5)],
+    samplers=[random.bernoulli, random.normal, random.normal],
+    tests=[forward_test, partial(backward_test, argnums=(1, 2))],
+  )
+  t2j_function_test(torch.norm, [(3, 5)], kwargs=dict(dim=1), tests=fbmo)
+  t2j_function_test(lambda x: torch.full_like(x, 2.0), [(3, 5)], tests=f)
+  t2j_function_test(lambda x: 0 * torch.nan_to_num(torch.empty_like(x)), [(3, 5)], tests=f)
+  t2j_function_test(lambda x: x.type(torch.int32), [(3, 5)], tests=f)
+  t2j_function_test(lambda x, y: x.type_as(y), [(3, 5), (3, 5)], tests=f)
   t2j_function_test(lambda x: (x > 0.0).float(), [(3,)], tests=fb)
+  t2j_function_test(torch.chunk, [(3, 6)], kwargs=dict(chunks=3, dim=1), tests=fbm)
+  t2j_function_test(torch.split, [(3, 6)], kwargs=dict(split_size_or_sections=2, dim=1), tests=fbm)
+  t2j_function_test(torch.split, [(3, 6)], kwargs=dict(split_size_or_sections=[1, 2, 3], dim=1), tests=fbm)
+  t2j_function_test(lambda x: x.unbind(dim=-1), [(3, 5)], tests=fbm)
+  assert t2j(lambda x: x.type())(jnp.ones((3,), dtype=jnp.float32)) == "torch.float32"
+  aac(t2j(lambda x: x.tolist())(jnp.arange(6).reshape(2, 3)), torch.arange(6).reshape(2, 3).tolist())
 
 
 def test_scatter():

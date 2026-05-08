@@ -4,6 +4,7 @@
 
 from functools import partial
 
+import jax
 import jax.numpy as jnp
 import torch
 from jax import grad, jit, random
@@ -124,6 +125,14 @@ def test_torch_nn_Conv2d():
               aac(jax_grad["weight"], model.weight.grad, atol=1e-4)
               if bias:
                 aac(jax_grad["bias"], model.bias.grad, atol=1e-3)
+
+
+def test_torch_nn_functional_conv3d():
+  cpu = jax.devices("cpu")[0]
+  sampler = lambda key, shape: jax.device_put(0.1 * random.normal(key, shape), cpu)
+  tests = [forward_test, partial(backward_test, argnums=(0, 1, 2))]
+  t2j_function_test(torch.nn.functional.conv3d, [(2, 2, 5, 6, 7), (4, 2, 3, 3, 3), (4,)], kwargs=dict(stride=(1, 2, 1), padding=1), samplers=[sampler, sampler, sampler], atol=1e-5, tests=tests)
+  t2j_function_test(torch.nn.functional.conv3d, [(2, 2, 5, 6, 7), (4, 1, 3, 3, 3)], kwargs=dict(stride=1, padding=1, groups=2), samplers=[sampler, sampler], atol=1e-5, tests=[forward_test, partial(backward_test, argnums=(0, 1))])
 
 
 def test_torch_nn_ConvTranspose2d():
@@ -350,6 +359,32 @@ def test_torch_nn_functional_batch_norm():
 def test_torch_nn_functional_prelu():
   t2j_function_test(torch.nn.functional.prelu, [(6, 6), (1)], atol=1e-6)
   t2j_function_test(torch.nn.functional.prelu, [(5, 3, 112, 122), (3,)], atol=1e-6)
+
+
+def test_torch_nn_functional_avg_pool3d():
+  cpu = jax.devices("cpu")[0]
+  t2j_function_test(
+    torch.nn.functional.avg_pool3d,
+    [(2, 3, 5, 6, 7)],
+    kwargs=dict(kernel_size=(2, 2, 2), stride=(1, 2, 1)),
+    samplers=[lambda key, shape: jax.device_put(random.normal(key, shape), cpu)],
+    atol=1e-6,
+    tests=[forward_test, backward_test],
+  )
+
+
+def test_torch_nn_functional_norms():
+  cpu = jax.devices("cpu")[0]
+  sampler = lambda key, shape: jax.device_put(random.normal(key, shape), cpu)
+  tests = [forward_test, backward_test]
+  t2j_function_test(lambda x, w: torch.nn.functional.rms_norm(x, (x.shape[-1],), w), [(2, 3, 5), (5,)], samplers=[sampler, sampler], atol=1e-4, tests=tests)
+  t2j_function_test(lambda x, w, b: torch.nn.functional.group_norm(x, 2, w, b), [(2, 4, 5, 6), (4,), (4,)], samplers=[sampler, sampler, sampler], atol=1e-5, tests=tests)
+  t2j_function_test(lambda x: torch.nn.functional.normalize(x, p=2.5, dim=-1, eps=1e-5), [(2, 3, 5)], samplers=[sampler], atol=1e-6, tests=tests)
+
+
+def test_torch_nn_functional_pad():
+  cpu = jax.devices("cpu")[0]
+  t2j_function_test(lambda x: torch.nn.functional.pad(x, (1, 2, 3, 4), value=1.5), [(2, 3, 5, 6)], samplers=[lambda key, shape: jax.device_put(random.normal(key, shape), cpu)], atol=1e-6, tests=[forward_test, backward_test])
 
 
 def test_torch_nn_functional_silu():
