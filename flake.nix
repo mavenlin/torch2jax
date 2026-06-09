@@ -18,6 +18,10 @@
       with pkgs.python3.pkgs;
       let
         jaxlib' = if jaxlib.meta.broken then jaxlib-bin else jaxlib;
+        flax' = flax.overridePythonAttrs (old: {
+          doCheck = false;
+          nativeCheckInputs = [ ];
+        });
       in
       {
         defaultPackage = buildPythonPackage {
@@ -28,7 +32,7 @@
           src = ./.;
           dependencies = [
             einops
-            flax
+            flax'
             jax
             torch
           ];
@@ -51,7 +55,7 @@
             build
             chex
             einops
-            flax
+            flax'
             ipython
             jax
             jaxlib'
