@@ -1,20 +1,20 @@
+import builtins
 import copy
 import functools
 import math
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import is_dataclass
-from functools import partial
 from numbers import Integral
 from typing import Literal, Optional, Sequence, Tuple, Union
 
+import einops._backends as einops_backends
 import jax
 import jax.dlpack
 import jax.numpy as jnp
 import numpy as np
-import einops._backends as einops_backends
-from flax import nnx
 import torch
+from flax import nnx
 from torch.overrides import TorchFunctionMode, resolve_name
 from torch.utils._pytree import register_pytree_node as torch_register_pytree_node
 from torch.utils._pytree import tree_map as torch_tree_map
@@ -238,11 +238,40 @@ class Torchish:
     return torch.permute(self, shape)
   def size(self, dim=None): return self.shape if dim is None else self.value.shape[dim]
   def split(self, split_size_or_sections, dim=0): return torch.split(self, split_size_or_sections, dim=dim)
-  def tolist(self): return [self[i] for i in range(self.shape[0])] if self.ndim > 0 else self.item()
+  def tolist(self): return self.value.tolist()
   def type(self, dtype=None):
     if dtype is None:
-      return str(self.dtype)
+      return TT_DTYPE_NAMES[self.dtype]
     return self.to(dtype=dtype)
+  def type_as(self, other): return Torchish(jnp.astype(self.value, _coerce(other).dtype))
+  def unflatten(self, dim, sizes):
+    if dim < 0:
+      dim += self.ndim
+    sizes = list(sizes)
+    if sizes.count(-1) > 1:
+      raise ValueError("Only one inferred dimension is allowed in unflatten")
+    if -1 in sizes:
+      inferred = self.shape[dim] // math.prod(size for size in sizes if size != -1)
+      sizes[sizes.index(-1)] = inferred
+    newshape = self.shape[:dim] + tuple(sizes) + self.shape[dim + 1:]
+    return Torchish(jnp.reshape(self.value, newshape))
+  # fmt: on
+
+  def view(self, *shape_or_dtype):
+    normalize_shape = lambda shape: tuple(_coerce(dim) for dim in shape)
+
+    if len(shape_or_dtype) == 1:
+      if isinstance(shape_or_dtype[0], Sequence):
+        return Torchish(self.value.reshape(normalize_shape(shape_or_dtype[0])))
+      elif isinstance(shape_or_dtype[0], Integral) or _is_symbolic_dim(shape_or_dtype[0]):
+        return Torchish(self.value.reshape((_coerce(shape_or_dtype[0]),)))
+      elif isinstance(dtype := shape_or_dtype[0], torch.dtype):
+        return Torchish(self.value.view(t2j_dtype(dtype)))
+      else:
+        raise ValueError(f"Tensor.view takes shape or dtype, got {shape_or_dtype[0]}")
+
+    return Torchish(jnp.reshape(self.value, normalize_shape(shape_or_dtype)))
+
   def to(self, *args, **kwargs):
     dtype = kwargs.get("dtype", None)
     if dtype is None:
@@ -262,49 +291,13 @@ class Torchish:
     if dtype is None:
       return self  # ignore device movement, jax manages its own placement.
     return Torchish(jnp.astype(self.value, t2j_dtype(dtype)))
-  def type_as(self, other): return Torchish(jnp.astype(self.value, _coerce(other).dtype))
-  def unflatten(self, dim, sizes):
-    if dim < 0:
-      dim += self.ndim
-    sizes = list(sizes)
-    if sizes.count(-1) > 1:
-      raise ValueError("Only one inferred dimension is allowed in unflatten")
-    if -1 in sizes:
-      inferred = self.shape[dim] // math.prod(size for size in sizes if size != -1)
-      sizes[sizes.index(-1)] = inferred
-    newshape = self.shape[:dim] + tuple(sizes) + self.shape[dim + 1:]
-    return Torchish(jnp.reshape(self.value, newshape))
-  # fmt: on
 
-  def view(self, *shape_or_dtype, **kwargs):
-    normalize_shape = lambda shape: tuple(_coerce(dim) for dim in shape)
-
+  def reshape(self, *shape, **kwargs):
     if kwargs:
-      assert len(kwargs) == 1 and "shape" in kwargs, f"Unsupported Tensor.view kwargs: {kwargs}"
-      assert len(shape_or_dtype) == 0, "Cannot pass both shape args and shape kwarg"
-      shape_or_dtype = (kwargs["shape"],)
-
-    if len(shape_or_dtype) == 1:
-      if isinstance(shape_or_dtype[0], Sequence):
-        return Torchish(self.value.reshape(normalize_shape(shape_or_dtype[0])))
-      elif isinstance(shape_or_dtype[0], Integral) or _is_symbolic_dim(shape_or_dtype[0]):
-        return Torchish(self.value.reshape((_coerce(shape_or_dtype[0]),)))
-      elif isinstance(dtype := shape_or_dtype[0], torch.dtype):
-        return Torchish(self.value.view(t2j_dtype(dtype)))
-      else:
-        raise ValueError(f"Tensor.view takes shape or dtype, got {shape_or_dtype[0]}")
-
-    return Torchish(jnp.reshape(self.value, normalize_shape(shape_or_dtype)))
-
-  def to(self, *args, **kwargs):
-    # ignore device movement, jax manages its own placement
-    if len(args) > 0 and isinstance(args[0], torch.dtype):
-      return Torchish(jnp.astype(self.value, t2j_dtype(args[0])))
-    if dtype := kwargs.get("dtype"):
-      return Torchish(jnp.astype(self.value, t2j_dtype(dtype)))
-    return self
-
-  reshape = view
+      assert len(kwargs) == 1 and "shape" in kwargs, f"Unsupported Tensor.reshape kwargs: {kwargs}"
+      assert len(shape) == 0, "Cannot pass both shape args and shape kwarg"
+      shape = (kwargs["shape"],)
+    return self.view(*shape)
 
   def bernoulli_(self, p=0.5):
     # Torch accepts ints, floats, and even torch.Tensor's for p, but jax.numpy only accepts floats, so we convert.
@@ -341,17 +334,19 @@ def _coerce(x):
   JAX-compatible."""
   if isinstance(x, Torchish):
     return x.value
-  elif isinstance(x, (int, float, np.integer, np.floating, np.ndarray, jnp.ndarray)) or _is_symbolic_dim(x):  # jax compatible types
+  elif isinstance(x, (str, int, float, np.integer, np.floating, np.ndarray, jnp.ndarray)) or _is_symbolic_dim(
+    x
+  ):  # jax compatible types
     return x
   elif x is Ellipsis:
     return x
-  elif any(x is e for e in (None, Ellipsis)):  # jax compatible special values
+  elif x is None:  # jax compatible special value
     return x
   elif isinstance(x, torch.dtype):
     return t2j_dtype(x)
   else:
     raise NotImplementedError(
-      f"Attempted to _coerce with {x}, type {type(x)}. Don't know what to do with that. _coerce supports int, float, numpy arrays, None, Ellipsis, and Torchish values."
+      f"Attempted to _coerce with {x}, type {type(x)}. Don't know what to do with that. _coerce supports str, int, float, numpy arrays, None, Ellipsis, and Torchish values."
     )
 
 
@@ -361,7 +356,7 @@ def _tree_coerce(x):
 
   while len(specs) > 0:
     spec = specs.popleft()
-    specs.extend(spec.children_specs)
+    specs.extend(spec.children())
     if spec.is_leaf():
       continue
     if spec.type in jax._src.tree_util._registry:
@@ -1173,13 +1168,15 @@ def conv3d(
   dilation=1,
   groups=1,
 ):
-  if isinstance(stride, int): stride = (stride,) * 3
+  if isinstance(stride, int):
+    stride = (stride,) * 3
   if isinstance(padding, int):
     padding = [(padding, padding)] * 3
   elif isinstance(padding, tuple):
     p1, p2, p3 = padding
     padding = [(p1, p1), (p2, p2), (p3, p3)]
-  if isinstance(dilation, int): dilation = (dilation,) * 3
+  if isinstance(dilation, int):
+    dilation = (dilation,) * 3
 
   res = jax.lax.conv_general_dilated(
     lhs=_v(input),
@@ -1504,7 +1501,7 @@ def embedding(
       w = primals[0]
       w_dot = tangents[0]
       primal_out = f(w)
-      size = min(w.shape[0], input.size)
+      size = builtins.min(w.shape[0], input.size)
       indices, counts = jnp.unique_counts(input, size=size, fill_value=w.shape[0])
       inv_freq = 1.0 / counts
       slicing = (...,) + (jnp.newaxis,) * (weight.ndim - 1)
@@ -1961,6 +1958,7 @@ def override_torch_constructors():
   finally:
     torch.arange, torch.zeros = original_arange, original_zeros
 
+
 def t2j_function(f):
   def f_jax(*args, rng=None, **kwargs):
     torch_args = jax.tree.map(Torchish, args)
@@ -1990,6 +1988,7 @@ TJ_DTYPE_ASSOCIATION = [
   (torch.complex128, jnp.complex128),
   (torch.bfloat16, jnp.bfloat16),
 ]
+TT_DTYPE_NAMES = {t_dtype: torch.empty((), dtype=t_dtype).type() for t_dtype, _ in TJ_DTYPE_ASSOCIATION}
 
 
 def t2j_dtype(dtype):
@@ -2025,7 +2024,7 @@ def t2j_module(module, function_names=None):
             # because the underlying parameter is only registered once as "embedding.weight".
             m._parameters[name] = torchish_dict[reverse_dict[param]]
           else:
-            torchish = Torchish(self._params[".".join(prefix + [name])].value)
+            torchish = Torchish(self._params[".".join(prefix + [name])].get_value())
             m._parameters[name] = torchish
             torchish_dict[".".join(prefix + [name])] = torchish
             reverse_dict[param] = ".".join(prefix + [name])
@@ -2035,7 +2034,7 @@ def t2j_module(module, function_names=None):
           if ".".join(prefix + [name]) not in module.state_dict().keys():
             m._buffers[name] = Torchish(t2j(buffer))
           else:
-            m._buffers[name] = Torchish(self._buffers[".".join(prefix + [name])].value)
+            m._buffers[name] = Torchish(self._buffers[".".join(prefix + [name])].get_value())
 
         # NOTE: named_children() is the non-recursive version of named_modules()
         for name, child in m.named_children():

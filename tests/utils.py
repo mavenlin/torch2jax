@@ -88,11 +88,12 @@ def _arg2t(x):
 def forward_test(f, args, kwargs={}, test_jit=True, **assert_kwargs):
   torch_args = jax.tree.map(_arg2t, args)
   torch_kwargs = jax.tree.map(_arg2t, kwargs)
-  f_ = lambda *args, **kwargs: f(*args, **torch_kwargs)
-  torch_output = f_(*torch_args)
-  aac(t2j(f_)(*args), torch_output, **assert_kwargs)
+  torch_f = lambda *args: f(*args, **torch_kwargs)
+  jax_f = lambda *args: f(*args, **kwargs)
+  torch_output = torch_f(*torch_args)
+  aac(t2j(jax_f)(*args), torch_output, **assert_kwargs)
   if test_jit:
-    aac(jit(t2j(f_))(*args), torch_output, **assert_kwargs)
+    aac(jit(t2j(jax_f))(*args), torch_output, **assert_kwargs)
 
 
 def backward_test(f, args, kwargs={}, argnums=None, **assert_kwargs):
@@ -103,10 +104,14 @@ def backward_test(f, args, kwargs={}, argnums=None, **assert_kwargs):
   torch_args = jax.tree.map(_arg2t, args)
   torch_kwargs = jax.tree.map(_arg2t, kwargs)
   # always reduce output to the mean of all elements
-  f_ = lambda *args: torch.cat(list(map(lambda x: x.flatten(), torch_tree_leaves(f(*args, **torch_kwargs))))).mean()
+  torch_f = lambda *args: torch.cat(
+    list(map(lambda x: x.flatten(), torch_tree_leaves(f(*args, **torch_kwargs))))
+  ).mean()
+  jax_inner = lambda *args: f(*args, **kwargs)
+  jax_f = lambda *args: jnp.concatenate(list(map(lambda x: x.flatten(), jax.tree.leaves(t2j(jax_inner)(*args))))).mean()
   for t2j_grad, torch_grad in zip(
-    grad(t2j(f_), argnums=argnums)(*args),
-    torch.func.grad(f_, argnums=argnums)(*torch_args),
+    grad(jax_f, argnums=argnums)(*args),
+    torch.func.grad(torch_f, argnums=argnums)(*torch_args),
   ):
     aac(t2j_grad.squeeze(), torch_grad.squeeze(), **assert_kwargs)
 

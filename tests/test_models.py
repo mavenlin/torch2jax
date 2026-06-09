@@ -3,7 +3,7 @@ import socket
 import pytest
 import torch
 from flax import nnx
-from jax import grad, jit, random
+from jax import jit, random
 
 from torch2jax import RngPooper, j2t, t2j
 
@@ -33,7 +33,7 @@ def test_mlp():
     res_torch.pow(2).sum().backward()
     torch_grad = {k: v.grad for k, v in model.named_parameters()}
     for k, v in model.named_parameters():
-      aac(jax_grad[k].value, torch_grad[k], atol=1e-5)
+      aac(jax_grad[k].get_value(), torch_grad[k], atol=1e-5)
 
 
 def is_network_reachable():

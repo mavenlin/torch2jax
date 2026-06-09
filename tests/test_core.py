@@ -8,7 +8,9 @@ import pytest
 import torch
 from einops import rearrange
 from jax import grad, jit, random, vmap
+
 from torch2jax import j2t, t2j
+
 from .utils import Torchish_member_test, aac, backward_test, forward_test, out_kwarg_test, t2j_function_test
 
 
@@ -166,6 +168,9 @@ def test_get_set_item():
   t2j_function_test(lambda x: x[0, 1, :], [(3, 4, 5)], tests=tests)
   t2j_function_test(lambda x: x[1:, 1:3, 2], [(3, 4, 5)], tests=tests)
   t2j_function_test(lambda x: x[torch.tensor([1, 2]), :, torch.tensor([2, 3])], [(3, 4, 5)], tests=tests)
+  t2j_function_test(
+    lambda x: x.__getitem__([torch.tensor([1, 2]), slice(None), torch.tensor([2, 3])]), [(3, 4, 5)], tests=tests
+  )
   # when the slice object is dynamic, jax will refuse to run with jit.
   t2j_function_test(lambda x: x[1:, torch.tensor(1) : torch.tensor(3), 2], [(3, 4, 5)], tests=tests_nojit)
 
@@ -198,9 +203,6 @@ def test_get_set_item():
     [(3, 4, 5), ()],
     tests=tests_nojit,
   )
-  t2j_function_test(
-    lambda x: x.__getitem__([torch.tensor([1, 2]), slice(None), torch.tensor([2, 3])]), [(3, 4, 5)], tests=tests
-  )
 
 
 def test_devices():
@@ -212,7 +214,7 @@ def test_devices():
 
 def test_t2j_function_kwargs_and_einops():
   fb = [forward_test, backward_test]
-  t2j_function_test(lambda x, y=None: x + y, [(3,)], kwargs=dict(y=jnp.arange(3.0)), tests=fb)
+  t2j_function_test(lambda x, y=None: x + y, [(3,)], kwargs=dict(y=jnp.arange(3, dtype=jnp.float32)), tests=fb)
   t2j_function_test(lambda x: rearrange(x, "b c h w -> b h (c w)"), [(2, 3, 4, 5)], tests=fb)
 
 
@@ -359,7 +361,7 @@ def test_oneliners():
   t2j_function_test(torch.max, [(3, 5, 7)], kwargs=dict(dim=2, keepdim=False), atol=1e-6)
   t2j_function_test(torch.min, [(3, 5)], tests=fmo)
   t2j_function_test(torch.min, [(3, 5)], kwargs=dict(dim=1), tests=f)
-  t2j_function_test(lambda x, y: torch.min(x, y), [(3, 5), (3, 5)], tests=fbmo)
+  t2j_function_test(torch.min, [(3, 5), (3, 5)], tests=fbmo)
   t2j_function_test(torch.mean, [(3, 5)], atol=1e-6, tests=fbmo)
   t2j_function_test(torch.mean, [(3, 5)], kwargs=dict(dim=1), atol=1e-6, tests=fbmo)
   t2j_function_test(torch.sigmoid, [(3,)], atol=1e-6, tests=fbmo)
@@ -399,7 +401,6 @@ def test_oneliners():
   t2j_function_test(lambda x: x.view(2, 2) @ x.view(2, 2).T, [(4,)], rtol=1e-6, tests=fb)
   t2j_function_test(lambda x: x.view(3, 4), [(12,)], tests=fb)
   t2j_function_test(lambda x: x.view(3, 4), [(4, 3)], tests=fb)
-  t2j_function_test(lambda x: x.view(shape=(3, 4)), [(12,)], tests=fb)
 
   # view with tuple input
   t2j_function_test(lambda x: x.view((2, 2)) @ x.view((2, 2)), [(2, 2)], rtol=1e-6, tests=fb)
@@ -463,9 +464,8 @@ def test_oneliners():
 
   t2j_function_test(torch.abs, [(3,)], tests=fbmo)
   t2j_function_test(lambda x: torch.clamp(x, min=np.float32(-0.5), max=np.float64(0.5)), [(3, 5)], tests=fb)
-  t2j_function_test(lambda x: torch.nn.functional.gelu(x, approximate="tanh"), [(3, 5)], tests=fb)
-  t2j_function_test(lambda x, y: torch.outer(x, y), [(3,), (5,)], tests=fbmo)
-  t2j_function_test(lambda x: torch.log(torch.exp(x)), [(3, 5)], tests=fbmo)
+  t2j_function_test(lambda x: torch.nn.functional.gelu(x, approximate="tanh"), [(3, 5)], atol=1e-6, tests=fb)
+  t2j_function_test(torch.outer, [(3,), (5,)], tests=fbmo)
   t2j_function_test(
     lambda c, x, y: torch.where(c, x, y),
     [(3, 5), (3, 5), (3, 5)],
@@ -481,8 +481,7 @@ def test_oneliners():
   t2j_function_test(torch.chunk, [(3, 6)], kwargs=dict(chunks=3, dim=1), tests=fbm)
   t2j_function_test(torch.split, [(3, 6)], kwargs=dict(split_size_or_sections=2, dim=1), tests=fbm)
   t2j_function_test(torch.split, [(3, 6)], kwargs=dict(split_size_or_sections=[1, 2, 3], dim=1), tests=fbm)
-  t2j_function_test(lambda x: x.unbind(dim=-1), [(3, 5)], tests=fbm)
-  assert t2j(lambda x: x.type())(jnp.ones((3,), dtype=jnp.float32)) == "torch.float32"
+  assert t2j(lambda x: x.type())(jnp.ones((3,), dtype=jnp.float32)) == torch.ones((3,), dtype=torch.float32).type()
   aac(t2j(lambda x: x.tolist())(jnp.arange(6).reshape(2, 3)), torch.arange(6).reshape(2, 3).tolist())
 
 

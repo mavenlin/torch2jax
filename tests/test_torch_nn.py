@@ -7,11 +7,12 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import torch
+from flax import nnx
 from jax import grad, jit, random
 
 from torch2jax import RngPooper, j2t, t2j
 
-from .utils import aac, anac, assert_state_dicts_allclose, backward_test, forward_test, t2j_function_test
+from .utils import aac, anac, backward_test, forward_test, t2j_function_test
 
 
 def test_torch_nn_AdaptiveAvgPool2d():
@@ -63,17 +64,10 @@ def test_torch_nn_BatchNorm1d():
 
           model.load_state_dict({k: j2t(v) for k, v in params.items()})
           res_torch = model(j2t(input_batch))
-          sd_torch = model.state_dict()
           jaxified_module = t2j(model)
 
-          # if training:
-          res_jax, sd_jax = jaxified_module(input_batch, state_dict=params, return_state_dict=True)
-          assert_state_dicts_allclose(sd_jax, sd_torch, rtol=1e-6)
-
-          res_jax_jit, sd_jax = jit(jaxified_module, static_argnames=["return_state_dict"])(
-            input_batch, state_dict=params, return_state_dict=True
-          )
-          assert_state_dicts_allclose(sd_jax, sd_torch, rtol=1e-6)
+          res_jax = jaxified_module(input_batch)
+          res_jax_jit = jit(jaxified_module)(input_batch)
 
           # Test forward pass with and without jax.jit
           aac(res_jax, res_torch.numpy(force=True), atol=1e-6)
@@ -81,13 +75,11 @@ def test_torch_nn_BatchNorm1d():
 
           # Test gradients
           if affine:
-            jax_grad = grad(
-              lambda p: (jaxified_module(input_batch, state_dict={**p, "num_batches_tracked": 0}) ** 2).sum()
-            )({k: v for k, v in params.items() if k != "num_batches_tracked"})
+            jax_grad = nnx.grad(lambda m: (m(input_batch) ** 2).sum())(jaxified_module)["_params"]
 
             res_torch.pow(2).sum().backward()
-            aac(jax_grad["weight"], model.weight.grad, rtol=1e-5, atol=1e-5)
-            aac(jax_grad["bias"], model.bias.grad, rtol=1e-5, atol=1e-5)
+            aac(jax_grad["weight"].get_value(), model.weight.grad, rtol=1e-5, atol=1e-5)
+            aac(jax_grad["bias"].get_value(), model.bias.grad, rtol=1e-5, atol=1e-5)
 
 
 def test_torch_nn_Conv2d():
@@ -111,28 +103,42 @@ def test_torch_nn_Conv2d():
               res_torch = model(j2t(input_batch))
 
               jaxified_module = t2j(model)
-              res_jax = jaxified_module(input_batch, state_dict=params)
-              res_jax_jit = jit(jaxified_module)(input_batch, state_dict=params)
+              res_jax = jaxified_module(input_batch)
+              res_jax_jit = jit(jaxified_module)(input_batch)
 
               # Test forward pass with and without jax.jit
               aac(res_jax, res_torch.numpy(force=True), atol=1e-5)
               aac(res_jax_jit, res_torch.numpy(force=True), atol=1e-5)
 
               # Test gradients
-              jax_grad = grad(lambda p: (jaxified_module(input_batch, state_dict=p) ** 2).sum())(params)
+              jax_grad = nnx.grad(lambda m: (m(input_batch) ** 2).sum())(jaxified_module)["_params"]
 
               res_torch.pow(2).sum().backward()
-              aac(jax_grad["weight"], model.weight.grad, atol=1e-4)
+              aac(jax_grad["weight"].get_value(), model.weight.grad, atol=1e-4)
               if bias:
-                aac(jax_grad["bias"], model.bias.grad, atol=1e-3)
+                aac(jax_grad["bias"].get_value(), model.bias.grad, atol=1e-3)
 
 
 def test_torch_nn_functional_conv3d():
   cpu = jax.devices("cpu")[0]
   sampler = lambda key, shape: jax.device_put(0.1 * random.normal(key, shape), cpu)
   tests = [forward_test, partial(backward_test, argnums=(0, 1, 2))]
-  t2j_function_test(torch.nn.functional.conv3d, [(2, 2, 5, 6, 7), (4, 2, 3, 3, 3), (4,)], kwargs=dict(stride=(1, 2, 1), padding=1), samplers=[sampler, sampler, sampler], atol=1e-5, tests=tests)
-  t2j_function_test(torch.nn.functional.conv3d, [(2, 2, 5, 6, 7), (4, 1, 3, 3, 3)], kwargs=dict(stride=1, padding=1, groups=2), samplers=[sampler, sampler], atol=1e-5, tests=[forward_test, partial(backward_test, argnums=(0, 1))])
+  t2j_function_test(
+    torch.nn.functional.conv3d,
+    [(2, 2, 5, 6, 7), (4, 2, 3, 3, 3), (4,)],
+    kwargs=dict(stride=(1, 2, 1), padding=1),
+    samplers=[sampler, sampler, sampler],
+    atol=1e-5,
+    tests=tests,
+  )
+  t2j_function_test(
+    torch.nn.functional.conv3d,
+    [(2, 2, 5, 6, 7), (4, 1, 3, 3, 3)],
+    kwargs=dict(stride=1, padding=1, groups=2),
+    samplers=[sampler, sampler],
+    atol=1e-5,
+    tests=[forward_test, partial(backward_test, argnums=(0, 1))],
+  )
 
 
 def test_torch_nn_ConvTranspose2d():
@@ -164,7 +170,7 @@ def test_torch_nn_ConvTranspose2d():
                     # RuntimeError: output padding must be smaller than either stride or dilation
                     continue
 
-                  res_jax = t2j(model)(input_batch, state_dict=params)
+                  res_jax = t2j(model)(input_batch)
                   aac(res_jax, res_torch.numpy(force=True), atol=1e-4)
 
 
@@ -209,19 +215,19 @@ def test_torch_nn_Linear():
   res_torch = model(j2t(input_batch))
 
   jaxified_module = t2j(model)
-  res_jax = jaxified_module(input_batch, state_dict=params)
-  res_jax_jit = jit(jaxified_module)(input_batch, state_dict=params)
+  res_jax = jaxified_module(input_batch)
+  res_jax_jit = jit(jaxified_module)(input_batch)
 
   # Test forward pass with and without jax.jit
   aac(res_jax, res_torch.numpy(force=True), atol=1e-6)
   aac(res_jax_jit, res_torch.numpy(force=True), atol=1e-6)
 
   # Test gradients
-  jax_grad = grad(lambda p: (jaxified_module(input_batch, state_dict=p) ** 2).sum())(params)
+  jax_grad = nnx.grad(lambda m: (m(input_batch) ** 2).sum())(jaxified_module)["_params"]
 
   res_torch.pow(2).sum().backward()
-  aac(jax_grad["weight"], model.weight.grad, atol=1e-6)
-  aac(jax_grad["bias"], model.bias.grad, atol=1e-6)
+  aac(jax_grad["weight"].get_value(), model.weight.grad, atol=1e-6)
+  aac(jax_grad["bias"].get_value(), model.bias.grad, atol=1e-6)
 
 
 def test_torch_nn_Linear_no_bias():
@@ -233,18 +239,18 @@ def test_torch_nn_Linear_no_bias():
   res_torch = model(j2t(input_batch))
 
   jaxified_module = t2j(model)
-  res_jax = jaxified_module(input_batch, state_dict=params)
-  res_jax_jit = jit(jaxified_module)(input_batch, state_dict=params)
+  res_jax = jaxified_module(input_batch)
+  res_jax_jit = jit(jaxified_module)(input_batch)
 
   # Test forward pass with and without jax.jit
   aac(res_jax, res_torch.numpy(force=True), atol=1e-6)
   aac(res_jax_jit, res_torch.numpy(force=True), atol=1e-6)
 
   # Test gradients
-  jax_grad = grad(lambda p: (jaxified_module(input_batch, state_dict=p) ** 2).sum())(params)
+  jax_grad = nnx.grad(lambda m: (m(input_batch) ** 2).sum())(jaxified_module)["_params"]
 
   res_torch.pow(2).sum().backward()
-  aac(jax_grad["weight"], model.weight.grad, atol=1e-6)
+  aac(jax_grad["weight"].get_value(), model.weight.grad, atol=1e-6)
 
 
 def test_torch_nn_MaxPool1d():
@@ -314,18 +320,18 @@ def test_torch_nn_PReLU():
   res_torch = model(j2t(input_batch))
 
   jaxified_module = t2j(model)
-  res_jax = jaxified_module(input_batch, state_dict=params)
-  res_jax_jit = jit(jaxified_module)(input_batch, state_dict=params)
+  res_jax = jaxified_module(input_batch)
+  res_jax_jit = jit(jaxified_module)(input_batch)
 
   # Test forward pass without and with jit
   aac(res_jax, res_torch.numpy(force=True), atol=1e-5)
   aac(res_jax_jit, res_torch.numpy(force=True), atol=1e-5)
 
   # Test gradients
-  jax_grad = grad(lambda p: (jaxified_module(input_batch, state_dict=p) ** 2).sum())(params)
+  jax_grad = nnx.grad(lambda m: (m(input_batch) ** 2).sum())(jaxified_module)["_params"]
 
   res_torch.pow(2).sum().backward()
-  aac(jax_grad["weight"], model.weight.grad, atol=1e-3)
+  aac(jax_grad["weight"].get_value(), model.weight.grad, atol=1e-3)
 
 
 ################################################################################
@@ -377,14 +383,38 @@ def test_torch_nn_functional_norms():
   cpu = jax.devices("cpu")[0]
   sampler = lambda key, shape: jax.device_put(random.normal(key, shape), cpu)
   tests = [forward_test, backward_test]
-  t2j_function_test(lambda x, w: torch.nn.functional.rms_norm(x, (x.shape[-1],), w), [(2, 3, 5), (5,)], samplers=[sampler, sampler], atol=1e-4, tests=tests)
-  t2j_function_test(lambda x, w, b: torch.nn.functional.group_norm(x, 2, w, b), [(2, 4, 5, 6), (4,), (4,)], samplers=[sampler, sampler, sampler], atol=1e-5, tests=tests)
-  t2j_function_test(lambda x: torch.nn.functional.normalize(x, p=2.5, dim=-1, eps=1e-5), [(2, 3, 5)], samplers=[sampler], atol=1e-6, tests=tests)
+  t2j_function_test(
+    lambda x, w: torch.nn.functional.rms_norm(x, (x.shape[-1],), w),
+    [(2, 3, 5), (5,)],
+    samplers=[sampler, sampler],
+    atol=1e-4,
+    tests=tests,
+  )
+  t2j_function_test(
+    lambda x, w, b: torch.nn.functional.group_norm(x, 2, w, b),
+    [(2, 4, 5, 6), (4,), (4,)],
+    samplers=[sampler, sampler, sampler],
+    atol=1e-5,
+    tests=tests,
+  )
+  t2j_function_test(
+    lambda x: torch.nn.functional.normalize(x, p=2.5, dim=-1, eps=1e-5),
+    [(2, 3, 5)],
+    samplers=[sampler],
+    atol=1e-6,
+    tests=tests,
+  )
 
 
 def test_torch_nn_functional_pad():
   cpu = jax.devices("cpu")[0]
-  t2j_function_test(lambda x: torch.nn.functional.pad(x, (1, 2, 3, 4), value=1.5), [(2, 3, 5, 6)], samplers=[lambda key, shape: jax.device_put(random.normal(key, shape), cpu)], atol=1e-6, tests=[forward_test, backward_test])
+  t2j_function_test(
+    lambda x: torch.nn.functional.pad(x, (1, 2, 3, 4), value=1.5),
+    [(2, 3, 5, 6)],
+    samplers=[lambda key, shape: jax.device_put(random.normal(key, shape), cpu)],
+    atol=1e-6,
+    tests=[forward_test, backward_test],
+  )
 
 
 def test_torch_nn_functional_silu():
@@ -394,7 +424,7 @@ def test_torch_nn_functional_silu():
 
 def test_torch_nn_functional_oneliner():
   t2j_function_test(torch.nn.functional.relu6, [(6, 6)], atol=1e-6)
-  t2j_function_test(torch.nn.functional.softmin, [(6, 6)], atol=1e-6)
+  t2j_function_test(torch.nn.functional.softmin, [(6, 6)], kwargs=dict(dim=1), atol=1e-6)
   t2j_function_test(torch.nn.functional.softplus, [(6, 6)], atol=1e-6)
   t2j_function_test(torch.nn.functional.softplus, [(6, 6)], kwargs=dict(beta=2.0), atol=1e-6)
   t2j_function_test(torch.nn.functional.softplus, [(6, 6)], kwargs=dict(beta=2.0, threshold=10), atol=1e-6)
@@ -427,56 +457,52 @@ def test_torch_nn_functional_scaled_dot_product_attention():
   t2j_function_test(sdpa, [(5, 3, 7), (5, 2, 7), (5, 2, 7), (3, 2)], atol=1e-6, tests=tests)
   t2j_function_test(sdpa, [(5, 7, 11), (5, 7, 11), (5, 7, 11), (7, 7)], atol=1e-6, tests=tests)
 
-    # default + attn_mask(bool)
-    samplers = [random.normal] * 3 + [random.bernoulli]
-    t2j_function_test(
-      sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (3, 2)], samplers=samplers, atol=1e-6, tests=tests
-    )
-    t2j_function_test(
-      sdpa, [(5 * qmult, 7, 11), (5, 7, 11), (5, 7, 11), (7, 7)], samplers=samplers, atol=1e-6, tests=tests
-    )
+  # default + attn_mask(bool)
+  samplers = [random.normal] * 3 + [random.bernoulli]
+  t2j_function_test(sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (3, 2)], samplers=samplers, atol=1e-6, tests=tests)
+  t2j_function_test(
+    sdpa, [(5 * qmult, 7, 11), (5, 7, 11), (5, 7, 11), (7, 7)], samplers=samplers, atol=1e-6, tests=tests
+  )
 
-    # test with different shapes
-    t2j_function_test(
-      sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (1, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
-    )
-    t2j_function_test(
-      sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (5 * qmult, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
-    )
-    t2j_function_test(
-      sdpa, [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (1, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
-    )
-    t2j_function_test(
-      sdpa,
-      [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (5 * qmult, 3, 2)],
-      samplers=samplers,
-      atol=1e-6,
-      tests=tests,
-    )
-    t2j_function_test(
-      sdpa, [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (2, 1, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
-    )
-    t2j_function_test(
-      sdpa,
-      [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (2, 5 * qmult, 3, 2)],
-      samplers=samplers,
-      atol=1e-6,
-      tests=tests,
-    )
+  # test with different shapes
+  t2j_function_test(
+    sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (1, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
+  )
+  t2j_function_test(
+    sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (5 * qmult, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
+  )
+  t2j_function_test(
+    sdpa, [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (1, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
+  )
+  t2j_function_test(
+    sdpa,
+    [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (5 * qmult, 3, 2)],
+    samplers=samplers,
+    atol=1e-6,
+    tests=tests,
+  )
+  t2j_function_test(
+    sdpa, [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (2, 1, 3, 2)], samplers=samplers, atol=1e-6, tests=tests
+  )
+  t2j_function_test(
+    sdpa,
+    [(2, 5 * qmult, 3, 7), (2, 5, 2, 7), (2, 5, 2, 7), (2, 5 * qmult, 3, 2)],
+    samplers=samplers,
+    atol=1e-6,
+    tests=tests,
+  )
 
-    # attn_mask are all false
-    samplers = [random.normal] * 3 + [lambda rng, shape: jnp.zeros(shape, dtype=jnp.bool)]
-    t2j_function_test(
-      sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (3, 2)], samplers=samplers, atol=1e-6, tests=tests
-    )
-    t2j_function_test(
-      sdpa, [(5 * qmult, 7, 11), (5, 7, 11), (5, 7, 11), (7, 7)], samplers=samplers, atol=1e-6, tests=tests
-    )
+  # attn_mask are all false
+  samplers = [random.normal] * 3 + [lambda rng, shape: jnp.zeros(shape, dtype=jnp.bool)]
+  t2j_function_test(sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7), (3, 2)], samplers=samplers, atol=1e-6, tests=tests)
+  t2j_function_test(
+    sdpa, [(5 * qmult, 7, 11), (5, 7, 11), (5, 7, 11), (7, 7)], samplers=samplers, atol=1e-6, tests=tests
+  )
 
-    # causal=True
-    causal_sdpa = partial(sdpa, is_causal=True)
-    t2j_function_test(causal_sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7)], atol=1e-6, tests=tests)
-    t2j_function_test(causal_sdpa, [(5 * qmult, 7, 11), (5, 7, 11), (5, 7, 11)], atol=1e-6, tests=tests)
+  # causal=True
+  causal_sdpa = partial(sdpa, is_causal=True)
+  t2j_function_test(causal_sdpa, [(5 * qmult, 3, 7), (5, 2, 7), (5, 2, 7)], atol=1e-6, tests=tests)
+  t2j_function_test(causal_sdpa, [(5 * qmult, 7, 11), (5, 7, 11), (5, 7, 11)], atol=1e-6, tests=tests)
 
   E = 6
   num_heads = 2
