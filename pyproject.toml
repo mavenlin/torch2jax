@@ -11,7 +11,7 @@ authors = [
 ]
 description = "Run PyTorch in JAX. 🤝"
 readme = "README.md"
-dependencies = ["jax", "torch"]
+dependencies = ["einops", "flax", "jax", "torch"]
 
 [project.urls]
 "Homepage" = "https://github.com/samuela/torch2jax"

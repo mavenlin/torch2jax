@@ -27,6 +27,8 @@
           pyproject = true;
           src = ./.;
           dependencies = [
+            einops
+            flax
             jax
             torch
           ];
@@ -48,6 +50,8 @@
 
             build
             chex
+            einops
+            flax
             ipython
             jax
             jaxlib'
