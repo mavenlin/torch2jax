@@ -534,6 +534,13 @@ def arange(*args, **kwargs):
     raise ValueError("torch.arange takes 1-3 arguments")
 
 
+@implements(torch.meshgrid)
+def meshgrid(*tensors, indexing=None):
+  if len(tensors) == 1 and isinstance(tensors[0], Sequence):
+    tensors = tuple(tensors[0])
+  return tuple(jnp.meshgrid(*(_v(tensor) for tensor in tensors), indexing=indexing or "ij"))
+
+
 @implements(torch.bernoulli, out_kwarg=True)  # don't set member because Tensor.bernoulli has different signature
 def bernoulli(input, generator=None):
   assert generator is None, "TODO: implement `generator`"
@@ -574,6 +581,15 @@ def stack(tensors, dim=0):
   return jnp.stack([_v(x) for x in tensors], axis=dim)
 
 
+@implements(torch.tile, Torchish_member=True)
+def tile(input, dims):
+  if isinstance(dims, Sequence):
+    dims = tuple(_coerce(dim) for dim in dims)
+  else:
+    dims = _coerce(dims)
+  return jnp.tile(_v(input), dims)
+
+
 @implements(torch.cumsum, out_kwarg=True, Torchish_member=True)
 def cumsum(input, dim, *, dtype=None):
   if dtype is not None:
@@ -605,8 +621,13 @@ def empty(
 
 @implements(torch.flatten, Torchish_member=True)
 def flatten(input, start_dim=0, end_dim=-1):
-  assert end_dim == -1, "TODO: implement end_dim"
-  return jnp.reshape(_v(input), input.shape[:start_dim] + (-1,))
+  x = _v(input)
+  if start_dim < 0:
+    start_dim += x.ndim
+  if end_dim < 0:
+    end_dim += x.ndim
+  flat_size = math.prod(x.shape[start_dim : end_dim + 1])
+  return jnp.reshape(x, x.shape[:start_dim] + (flat_size,) + x.shape[end_dim + 1 :])
 
 
 @implements(torch.full, Torchishify_output=False)
@@ -1517,19 +1538,22 @@ def embedding(
 @implements(torch.nn.functional.layer_norm)
 def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-05):
   input = _v(input)
+  out_dtype = input.dtype
+  working = input.astype(jnp.float32)
 
   d = len(normalized_shape)
-  mean = jnp.mean(input, axis=tuple(range(input.ndim)[-d:]), keepdims=True)
-  # NOTE: According to https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html, PyTorch calculates variance
-  # without Bessel's correction. This is the default behavior in numpy, but we set `ddof=0` to be explicit.
-  var = jnp.var(input, axis=tuple(range(input.ndim)[-d:]), keepdims=True, ddof=0)
+  axes = tuple(range(working.ndim)[-d:])
+  n = math.prod(normalized_shape)
+  mean = jnp.sum(working, axis=axes, keepdims=True) / jnp.asarray(n, jnp.float32)
+  centered = working - mean
+  var = jnp.sum(centered * centered, axis=axes, keepdims=True) / jnp.asarray(n, jnp.float32)
 
-  res = (input - mean) / jnp.sqrt(var + eps)
+  res = centered * jax.lax.rsqrt(var + jnp.asarray(eps, jnp.float32))
   if weight is not None:
-    res *= _v(weight)
+    res *= _v(weight).astype(jnp.float32)
   if bias is not None:
-    res += _v(bias)
-  return res
+    res += _v(bias).astype(jnp.float32)
+  return res.astype(out_dtype)
 
 
 @implements(torch.nn.functional.rms_norm)
@@ -1809,9 +1833,6 @@ def scaled_dot_product_attention(
 ):
   assert dropout_p == 0.0, "TODO: implement dropout"
   Q, K, V = _v(query), _v(key), _v(value)
-  # torch has (batch, num_heads, seq_len, head_dim) for Q, K, V
-  # jax has (batch, seq_len, num_heads, head_dim)
-  Q, K, V = jnp.swapaxes(Q, -2, -3), jnp.swapaxes(K, -2, -3), jnp.swapaxes(V, -2, -3)
   mask, bias = None, None
   if attn_mask is not None:
     attn_mask = _v(attn_mask)
@@ -1821,8 +1842,36 @@ def scaled_dot_product_attention(
       bias = attn_mask
     else:
       raise ValueError(f"Unsupported attn_mask dtype: {attn_mask.dtype}. Expected bool or float.")
-  output = jax.nn.dot_product_attention(Q, K, V, scale=scale, mask=mask, bias=bias, is_causal=is_causal)
-  output = jnp.swapaxes(output, -2, -3)
+  if jax.default_backend() == "gpu":
+    from jax._src.cudnn.fused_attention_stablehlo import MaskType
+    from jax._src.nn.functions import cudnn_dot_product_attention
+
+    scale = (1.0 / math.sqrt(Q.shape[-1])) if scale is None else scale
+    output = cudnn_dot_product_attention(
+      Q,
+      K,
+      V,
+      bias=bias,
+      mask=mask,
+      scale=scale,
+      mask_type=MaskType.CAUSAL if is_causal else MaskType.NO_MASK,
+      qkv_layout="BNTH",
+    )
+  else:
+    # torch has (batch, num_heads, seq_len, head_dim) for Q, K, V
+    # jax has (batch, seq_len, num_heads, head_dim)
+    Q, K, V = jnp.swapaxes(Q, -2, -3), jnp.swapaxes(K, -2, -3), jnp.swapaxes(V, -2, -3)
+    output = jax.nn.dot_product_attention(
+      Q,
+      K,
+      V,
+      scale=scale,
+      mask=mask,
+      bias=bias,
+      is_causal=is_causal,
+      implementation="xla",
+    )
+    output = jnp.swapaxes(output, -2, -3)
   if mask is not None:
     # when attn_mask are all false in a row, torch returns 0.
     # while jax simply adds large negative numbers to the logits
@@ -1899,16 +1948,19 @@ def multi_head_attention_forward(
   Q1, K1, V1 = Q @ w_q.T + b_q, K @ w_k.T + b_k, V @ w_v.T + b_v
 
   # print(Q1.shape, K1.shape, V1.shape)  # (N, L, E) (N, S, E) (N, S, E)
-  sdpa = jnp.concatenate(
-    tuple(
-      _v(scaled_dot_product_attention(Torchish(q), Torchish(k), Torchish(v)))
-      for q, k, v in zip(
-        jnp.split(Q1, num_heads, axis=-1),
-        jnp.split(K1, num_heads, axis=-1),
-        jnp.split(V1, num_heads, axis=-1),
-      )
-    ),
-    axis=-1,
+  head_dim = embed_dim_to_check // num_heads
+  q = jnp.swapaxes(
+    jnp.reshape(Q1, (Q1.shape[0], Q1.shape[1], num_heads, head_dim)), 1, 2
+  )
+  k = jnp.swapaxes(
+    jnp.reshape(K1, (K1.shape[0], K1.shape[1], num_heads, head_dim)), 1, 2
+  )
+  v = jnp.swapaxes(
+    jnp.reshape(V1, (V1.shape[0], V1.shape[1], num_heads, head_dim)), 1, 2
+  )
+  sdpa = _v(scaled_dot_product_attention(Torchish(q), Torchish(k), Torchish(v)))
+  sdpa = jnp.reshape(
+    jnp.swapaxes(sdpa, 1, 2), (Q1.shape[0], Q1.shape[1], embed_dim_to_check)
   )
   # print(sdpa.shape)  # (N, L, E)
   out = sdpa @ out_proj_weight.T + out_proj_bias

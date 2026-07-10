@@ -384,6 +384,13 @@ def test_torch_nn_functional_norms():
   sampler = lambda key, shape: jax.device_put(random.normal(key, shape), cpu)
   tests = [forward_test, backward_test]
   t2j_function_test(
+    lambda x, w, b: torch.nn.functional.layer_norm(x, (x.shape[-1],), w, b),
+    [(2, 3, 5), (5,), (5,)],
+    samplers=[sampler, sampler, sampler],
+    atol=1e-5,
+    tests=tests,
+  )
+  t2j_function_test(
     lambda x, w: torch.nn.functional.rms_norm(x, (x.shape[-1],), w),
     [(2, 3, 5), (5,)],
     samplers=[sampler, sampler],

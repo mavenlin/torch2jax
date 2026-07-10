@@ -436,6 +436,8 @@ def test_oneliners():
   t2j_function_test(lambda x: x.expand(5, -1, -1), [(1, 3, 2)], tests=fb)
   t2j_function_test(lambda x: x.unflatten(1, (2, -1)), [(3, 8)], tests=fb)
   t2j_function_test(lambda x: x.repeat(2, 1), [(3, 5)], tests=fb)
+  t2j_function_test(lambda x: torch.tile(x, (2, 1)), [(3, 5)], tests=fb)
+  t2j_function_test(lambda x: x.tile(2), [(3, 5)], tests=fb)
   t2j_function_test(lambda x: x.repeat_interleave(np.int64(2), dim=np.int64(1)), [(3, 5)], tests=fb)
 
   t2j_function_test(lambda x: torch.transpose(x, 0, 1), [(2, 3)], tests=fb)
@@ -448,7 +450,10 @@ def test_oneliners():
 
   t2j_function_test(torch.flatten, [(2, 3, 5)], tests=fbm)
   t2j_function_test(torch.flatten, [(2, 3, 5)], kwargs=dict(start_dim=1), tests=fbm)
+  t2j_function_test(torch.flatten, [(2, 3, 5)], kwargs=dict(start_dim=1, end_dim=2), tests=fbm)
   t2j_function_test(torch.flatten, [(2, 3, 5, 7)], kwargs=dict(start_dim=2), tests=fbm)
+
+  t2j_function_test(lambda x, y: torch.meshgrid(x, y, indexing="ij"), [(3,), (5,)], tests=fb)
 
   t2j_function_test(lambda x: x - 0.5, [(3,)], tests=fb)
   t2j_function_test(lambda x: 0.5 - x, [(3,)], tests=fb)
