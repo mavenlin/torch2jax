@@ -2081,12 +2081,8 @@ def t2j_module(module, function_names=None):
             torchish_dict[".".join(prefix + [name])] = torchish
             reverse_dict[param] = ".".join(prefix + [name])
 
-        for name, buffer in m.named_buffers(recurse=False):
-          # buffers with register_buffer(persistent=False) won't appear in state_dict
-          if ".".join(prefix + [name]) not in module.state_dict().keys():
-            m._buffers[name] = Torchish(t2j(buffer))
-          else:
-            m._buffers[name] = Torchish(self._buffers[".".join(prefix + [name])].get_value())
+        for name, _ in m.named_buffers(recurse=False):
+          m._buffers[name] = Torchish(self._buffers[".".join(prefix + [name])].get_value())
 
         # NOTE: named_children() is the non-recursive version of named_modules()
         for name, child in m.named_children():

@@ -15,6 +15,25 @@ from torch2jax import RngPooper, j2t, t2j
 from .utils import aac, anac, backward_test, forward_test, t2j_function_test
 
 
+def test_torch_nn_module_buffers_use_converted_state():
+  class BufferedAdd(torch.nn.Module):
+    def __init__(self):
+      super().__init__()
+      self.register_buffer("persistent", torch.tensor(1.0))
+      self.register_buffer("nonpersistent", torch.tensor(2.0), persistent=False)
+
+    def forward(self, x):
+      return x + self.persistent + self.nonpersistent
+
+  model = t2j(BufferedAdd())
+  state = nnx.state(model)
+  state["_buffers"]["persistent"].set_value(jnp.asarray(10.0))
+  state["_buffers"]["nonpersistent"].set_value(jnp.asarray(20.0))
+  nnx.update(model, state)
+
+  assert model(jnp.asarray(0.0)) == 30.0
+
+
 def test_torch_nn_AdaptiveAvgPool2d():
   # for output_size in [1, 2, (3, 4), (None, 4), (5, None)]:
   for output_size in [1]:
