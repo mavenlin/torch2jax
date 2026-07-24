@@ -71,7 +71,8 @@ def t2j_array(torch_array):
   # See https://github.com/google/jax/issues/8082.
   # torch_array = torch_array.contiguous()
 
-  return jax.dlpack.from_dlpack(torch_array)
+  with torch.cuda.device_of(torch_array):
+    return jax.dlpack.from_dlpack(torch_array)
 
   # Alternative, but copying implementation:
   # Note FunctionalTensor.numpy() returns incorrect results, preventing us from using torch.func.functionalize.
