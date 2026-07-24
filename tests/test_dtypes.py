@@ -1,4 +1,6 @@
+import jax
 import jax.numpy as jnp
+import pytest
 import torch
 
 from torch2jax import j2t, t2j
@@ -62,6 +64,19 @@ def test_t2j_array_conversion():
   assert t2j(torch.tensor(0.0, dtype=torch.complex64)).dtype == jnp.complex64
   # assert t2j(torch.tensor(0.0, dtype=torch.complex128)).dtype == jnp.complex128  # requires jax_enable_x64
   assert t2j(torch.tensor(0.0, dtype=torch.bfloat16)).dtype == jnp.bfloat16
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_t2j_array_conversion_uses_tensor_cuda_device():
+  assert len(jax.devices("gpu")) >= 2
+  torch_array = torch.arange(4, dtype=torch.float32, device="cuda:0")
+
+  with torch.cuda.device(1):
+    jax_array = t2j(torch_array)
+    assert torch.cuda.current_device() == 1
+
+  assert jax_array.devices() == {t2j(torch_array.device)}
+  assert jnp.array_equal(jax_array, jnp.arange(4, dtype=jnp.float32))
 
 
 def test_j2t_array_conversion():
