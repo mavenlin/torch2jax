@@ -71,6 +71,9 @@ def t2j_array(torch_array):
   # See https://github.com/google/jax/issues/8082.
   # torch_array = torch_array.contiguous()
 
+  if torch_array.device.type == "cuda":
+    with torch.cuda.device(torch_array.device):
+      return jax.dlpack.from_dlpack(torch_array)
   return jax.dlpack.from_dlpack(torch_array)
 
   # Alternative, but copying implementation:
@@ -1842,7 +1845,13 @@ def scaled_dot_product_attention(
       bias = attn_mask
     else:
       raise ValueError(f"Unsupported attn_mask dtype: {attn_mask.dtype}. Expected bool or float.")
-  if jax.default_backend() == "gpu":
+  head_dim = Q.shape[-1]
+  use_cudnn = (
+    jax.default_backend() == "gpu"
+    and head_dim <= 256
+    and head_dim % 8 == 0
+  )
+  if use_cudnn:
     from jax._src.cudnn.fused_attention_stablehlo import MaskType
     from jax._src.nn.functions import cudnn_dot_product_attention
 
