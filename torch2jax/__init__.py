@@ -1151,6 +1151,41 @@ def batch_norm(
   return res
 
 
+@implements(torch.nn.functional.conv1d)
+def conv1d(
+  input,
+  weight,
+  bias=None,
+  stride=1,
+  padding: Union[int, Tuple[int], Literal["same", "valid"]] = 0,
+  dilation=1,
+  groups=1,
+):
+  if isinstance(stride, int):
+    stride = (stride,)
+  if isinstance(padding, int):
+    padding = [(padding, padding)]
+  elif isinstance(padding, tuple):
+    (p,) = padding
+    padding = [(p, p)]
+  if isinstance(dilation, int):
+    dilation = (dilation,)
+
+  res = jax.lax.conv_general_dilated(
+    lhs=_v(input),
+    rhs=_v(weight),
+    window_strides=stride,
+    padding=padding,
+    rhs_dilation=dilation,
+    dimension_numbers=("NCH", "OIH", "NCH"),
+    feature_group_count=groups,
+    precision=jax.lax.Precision.HIGH,
+  )
+  if bias is not None:
+    res += _v(bias)[jnp.newaxis, :, jnp.newaxis]
+  return res
+
+
 @implements(torch.nn.functional.conv2d)
 def conv2d(
   input,

@@ -138,6 +138,36 @@ def test_torch_nn_Conv2d():
                 aac(jax_grad["bias"].get_value(), model.bias.grad, atol=1e-3)
 
 
+def test_torch_nn_functional_conv1d():
+  cpu = jax.devices("cpu")[0]
+  sampler = lambda key, shape: jax.device_put(random.normal(key, shape), cpu)
+  tests = [forward_test, partial(backward_test, argnums=(0, 1, 2))]
+  t2j_function_test(
+    torch.nn.functional.conv1d,
+    [(2, 4, 16), (6, 4, 5), (6,)],
+    kwargs=dict(stride=2, padding=3, dilation=2),
+    samplers=[sampler, sampler, sampler],
+    atol=1e-5,
+    tests=tests,
+  )
+  t2j_function_test(
+    torch.nn.functional.conv1d,
+    [(2, 4, 16), (4, 1, 5)],
+    kwargs=dict(stride=(1,), padding=(2,), dilation=(1,), groups=4),
+    samplers=[sampler, sampler],
+    atol=1e-5,
+    tests=[forward_test, partial(backward_test, argnums=(0, 1))],
+  )
+  t2j_function_test(
+    torch.nn.functional.conv1d,
+    [(2, 4, 16), (6, 4, 5), (6,)],
+    kwargs=dict(padding="same"),
+    samplers=[sampler, sampler, sampler],
+    atol=1e-5,
+    tests=tests,
+  )
+
+
 def test_torch_nn_functional_conv3d():
   cpu = jax.devices("cpu")[0]
   sampler = lambda key, shape: jax.device_put(0.1 * random.normal(key, shape), cpu)
