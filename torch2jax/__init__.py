@@ -6,6 +6,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from numbers import Integral
+from types import MappingProxyType
 from typing import Literal, Optional, Sequence, Tuple, Union
 
 import einops._backends as einops_backends
@@ -121,6 +122,19 @@ def j2t_device(device):
 
 
 HANDLED_FUNCTIONS = {}
+_EMPTY_TORCH_FUNCTION_OVERRIDES = MappingProxyType({})
+
+
+def _freeze_torch_function_overrides(overrides):
+  if overrides is None:
+    return _EMPTY_TORCH_FUNCTION_OVERRIDES
+  frozen = dict(overrides)
+  if not builtins.all(
+    callable(function) and callable(implementation)
+    for function, implementation in frozen.items()
+  ):
+    raise TypeError("torch_function_overrides must map callables to callables")
+  return MappingProxyType(frozen)
 
 
 class Torchish:
@@ -2012,13 +2026,21 @@ def multi_head_attention_forward(
 
 
 class TorchishMode(TorchFunctionMode):
+  def __init__(self, torch_function_overrides=None):
+    self.torch_function_overrides = _freeze_torch_function_overrides(
+      torch_function_overrides
+    )
+
   def __torch_function__(self, func, types, args, kwargs=None):
     # print(f"Function Log: {resolve_name(func)}(*{args}, **{kwargs}) with types {types}")
 
     kwargs = kwargs or {}
 
-    if func in HANDLED_FUNCTIONS:
-      return HANDLED_FUNCTIONS[func](*args, **kwargs)
+    implementation = self.torch_function_overrides.get(
+      func, HANDLED_FUNCTIONS.get(func)
+    )
+    if implementation is not None:
+      return implementation(*args, **kwargs)
     else:
       raise NotImplementedError(
         f"Unhandled function call: {resolve_name(func)}(*{args}, **{kwargs}) with types {types}. Please submit a bug report at https://github.com/samuela/torch2jax/issues."
@@ -2046,23 +2068,35 @@ def override_Tensor_constructor():
 
 
 @contextmanager
-def override_torch_constructors():
+def override_torch_constructors(torch_function_overrides=None):
+  torch_function_overrides = _freeze_torch_function_overrides(
+    torch_function_overrides
+  )
   original_arange, original_zeros = torch.arange, torch.zeros
-  torch.arange, torch.zeros = HANDLED_FUNCTIONS[torch.arange], HANDLED_FUNCTIONS[torch.zeros]
+  torch.arange = torch_function_overrides.get(
+    original_arange, HANDLED_FUNCTIONS[original_arange]
+  )
+  torch.zeros = torch_function_overrides.get(
+    original_zeros, HANDLED_FUNCTIONS[original_zeros]
+  )
   try:
     yield
   finally:
     torch.arange, torch.zeros = original_arange, original_zeros
 
 
-def t2j_function(f):
+def t2j_function(f, *, torch_function_overrides=None):
+  torch_function_overrides = _freeze_torch_function_overrides(
+    torch_function_overrides
+  )
+
   def f_jax(*args, rng=None, **kwargs):
     torch_args = jax.tree.map(Torchish, args)
     torch_kwargs = jax.tree.map(Torchish, kwargs)
     with override_Tensor_constructor():
-      with override_torch_constructors():
+      with override_torch_constructors(torch_function_overrides):
         with RngPooperContext(None if rng is None else RngPooper(rng)):
-          with TorchishMode():
+          with TorchishMode(torch_function_overrides):
             out = f(*torch_args, **torch_kwargs)
     # use the torch's tree_map, because out is generated from torch code
     return _tree_coerce(out)
@@ -2095,8 +2129,14 @@ def j2t_dtype(dtype):
   return next(t_dtype for t_dtype, j_dtype in TJ_DTYPE_ASSOCIATION if j_dtype == dtype)
 
 
-def t2j_module(module, function_names=None):
-  """Convert a torch.nn.Module to a flax.nnx.Module."""
+def t2j_module(module, function_names=None, *, torch_function_overrides=None):
+  """Convert a torch.nn.Module to a flax.nnx.Module.
+
+  ``torch_function_overrides`` applies only while invoking this converted
+  module and takes precedence over torch2jax's default implementations.
+  """
+
+  torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
 
   class JaxModule(nnx.Module):
     def __init__(self, torch_module, rngs=None):
@@ -2144,7 +2184,9 @@ def t2j_module(module, function_names=None):
 
       def f(self, *args, _fn=fn, **kwargs):
         original_f = getattr(self._prepare(), _fn)
-        return t2j_function(original_f)(*args, **kwargs)
+        return t2j_function(
+          original_f, torch_function_overrides=torch_function_overrides
+        )(*args, **kwargs)
 
       setattr(JaxModule, fn, f)
   else:
@@ -2152,18 +2194,18 @@ def t2j_module(module, function_names=None):
   return jax_module
 
 
-def t2j(thing):
+def t2j(thing, *, torch_function_overrides=None):
   if isinstance(thing, torch.Tensor):
     return t2j_array(thing)
   elif isinstance(thing, torch.nn.Module):
-    return t2j_module(thing)
+    return t2j_module(thing, torch_function_overrides=torch_function_overrides)
   elif isinstance(thing, torch.device):
     return t2j_device(thing)
   elif isinstance(thing, torch.dtype):
     return t2j_dtype(thing)
   elif callable(thing):
     # This branch must live below the torch.nn.Module branch!
-    return t2j_function(thing)
+    return t2j_function(thing, torch_function_overrides=torch_function_overrides)
   else:
     raise NotImplementedError
 

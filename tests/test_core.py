@@ -8,10 +8,52 @@ import pytest
 import torch
 from einops import rearrange
 from jax import grad, jit, random, vmap
+from torch.overrides import handle_torch_function, has_torch_function
 
-from torch2jax import j2t, t2j
+from torch2jax import Torchish, j2t, t2j, t2j_module
 
 from .utils import Torchish_member_test, aac, backward_test, forward_test, out_kwarg_test, t2j_function_test
+
+
+def custom_offset(input):
+  if has_torch_function((input,)):
+    return handle_torch_function(custom_offset, (input,), input)
+  return input + 1
+
+
+class CustomOffsetChild(torch.nn.Module):
+  def forward(self, input):
+    return custom_offset(input)
+
+
+class CustomOffsetModule(torch.nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.child = CustomOffsetChild()
+
+  def forward(self, input):
+    return self.child(input)
+
+
+def test_t2j_module_scoped_torch_function_overrides():
+  inputs = jnp.arange(4, dtype=jnp.float32)
+  first_overrides = {custom_offset: lambda input: Torchish(input.value + 2)}
+  first = t2j_module(
+    CustomOffsetModule(),
+    torch_function_overrides=first_overrides,
+  )
+  second = t2j_module(
+    CustomOffsetModule(),
+    torch_function_overrides={custom_offset: lambda input: Torchish(input.value + 3)},
+  )
+  first_overrides[custom_offset] = lambda input: Torchish(input.value + 4)
+
+  np.testing.assert_array_equal(first(inputs), inputs + 2)
+  np.testing.assert_array_equal(second(inputs), inputs + 3)
+  np.testing.assert_array_equal(jit(first)(inputs), inputs + 2)
+  np.testing.assert_array_equal(grad(lambda x: first(x).sum())(inputs), jnp.ones_like(inputs))
+  with pytest.raises(NotImplementedError, match="Unhandled function call"):
+    t2j_module(CustomOffsetModule())(inputs)
 
 
 def test_arange():
