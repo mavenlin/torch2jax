@@ -6,6 +6,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import pytest
 import torch
 from flax import nnx
 from jax import grad, jit, random
@@ -589,3 +590,35 @@ def test_torch_nn_functional_embedding():
   embedding = lambda input, weight: torch.nn.functional.embedding(input, weight, scale_grad_by_freq=True).mean()
   t2j_function_test(embedding, [(20,), (10, 3)], samplers=samplers, atol=1e-6, tests=tests)
   t2j_function_test(embedding, [(4, 20), (10, 3)], samplers=samplers, atol=1e-6, tests=tests)
+
+
+def test_torch_nn_functional_interpolate_nearest():
+  cpu = jax.devices("cpu")[0]
+  sampler = lambda key, shape: jax.device_put(random.normal(key, shape), cpu)
+  for mode in ("nearest", "nearest-exact"):
+    for shape, kwargs in (
+      ((2, 3, 5), {"scale_factor": 2.0}),
+      ((2, 3, 4, 5), {"size": (8, 15)}),
+      ((2, 3, 4, 5), {"scale_factor": (2.0, 2.0)}),
+      ((2, 3, 2, 4, 5), {"scale_factor": (2, 2, 3)}),
+      ((2, 3, 2, 4, 5), {"scale_factor": (1, 2, 2)}),
+    ):
+      t2j_function_test(
+        partial(torch.nn.functional.interpolate, mode=mode, **kwargs),
+        [shape],
+        samplers=[sampler],
+        atol=0,
+        tests=[forward_test, backward_test],
+      )
+
+
+def test_torch_nn_functional_interpolate_rejects_unsupported():
+  x = jnp.zeros((2, 3, 4, 4))
+  with pytest.raises(NotImplementedError):
+    t2j(partial(torch.nn.functional.interpolate, scale_factor=2.0, mode="bilinear"))(x)
+  with pytest.raises(NotImplementedError):
+    t2j(partial(torch.nn.functional.interpolate, scale_factor=1.5, mode="nearest"))(x)
+  with pytest.raises(NotImplementedError):
+    t2j(partial(torch.nn.functional.interpolate, size=(6, 6), mode="nearest"))(x)
+  with pytest.raises(ValueError):
+    t2j(partial(torch.nn.functional.interpolate, mode="nearest"))(x)
