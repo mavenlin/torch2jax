@@ -715,3 +715,22 @@ def test_tuple_return_function():
     return y1, y2
 
   t2j_function_test(f, [(3,)], tests=[forward_test])
+
+
+def test_expand_extra_leading_dims():
+  t2j_function_test(lambda x: x.expand(3, 5, -1, 8), [(1, 8)])
+  t2j_function_test(lambda x: x.expand(2, -1, -1), [(4, 6)])
+  t2j_function_test(lambda x: x.expand(4, 2, 8), [(2, 8)], tests=[forward_test])
+  with pytest.raises(AssertionError):
+    t2j(lambda x: x.expand(-1, 2, 8))(jnp.zeros((2, 8)))
+
+
+def test_rpow_rtruediv_scalar_left():
+  t2j_function_test(lambda x: 2.0 ** x, [(4, 6)])
+  t2j_function_test(lambda x: 3.0 / x, [(4, 6)], samplers=[lambda key, shape: 1.0 + random.uniform(key, shape)])
+
+
+def test_einsum_list_form():
+  t2j_function_test(lambda a, b: torch.einsum("i,j->ij", a, b), [(5,), (7,)])
+  t2j_function_test(lambda a, b: torch.einsum("i,j->ij", [a, b]), [(5,), (7,)])
+  t2j_function_test(lambda a, b: torch.einsum("bij,bjk->bik", a, b), [(2, 3, 4), (2, 4, 3)], atol=1e-6)
