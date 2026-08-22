@@ -1772,35 +1772,44 @@ def group_norm(input, num_groups, weight=None, bias=None, eps=1e-05):
 
 @implements(torch.nn.functional.interpolate)
 def interpolate(
-  input,
-  size=None,
-  scale_factor=None,
-  mode="nearest",
-  align_corners=None,
-  recompute_scale_factor=None,
-  antialias=False,
+  input, size=None, scale_factor=None, mode="nearest", align_corners=None, recompute_scale_factor=None, antialias=False
 ):
-  assert mode == "nearest", "TODO: implement modes other than nearest"
-  assert align_corners is None
-  assert not antialias
-  assert 3 <= input.ndim <= 5
-  assert (size is None) != (scale_factor is None)
-
-  spatial_shape = input.shape[2:]
-  if size is not None:
-    output_shape = (size,) * len(spatial_shape) if isinstance(size, int) else tuple(size)
-    scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
+  if mode not in ("nearest", "nearest-exact"):
+    raise NotImplementedError(f"interpolate: only nearest/nearest-exact modes are supported, got mode={mode!r}")
+  if antialias:
+    raise NotImplementedError("interpolate: antialias=True is not supported")
+  if align_corners is not None:
+    raise NotImplementedError("interpolate: align_corners is not supported for nearest/nearest-exact")
+  x = _v(input)
+  if x.ndim not in (3, 4, 5):
+    raise NotImplementedError(f"interpolate: expected 3D/4D/5D input, got {x.ndim}D")
+  spatial = tuple(x.shape[2:])
+  if (size is None) == (scale_factor is None):
+    raise ValueError("interpolate: exactly one of size or scale_factor must be defined")
+  if scale_factor is not None:
+    factors = tuple(scale_factor) if isinstance(scale_factor, (list, tuple)) else (scale_factor,) * len(spatial)
+    if len(factors) != len(spatial):
+      raise ValueError(f"interpolate: scale_factor length {len(factors)} != spatial dims {len(spatial)}")
+    if not builtins.all(float(f).is_integer() and f >= 1 for f in factors):
+      raise NotImplementedError(f"interpolate: only integer scale factors >= 1 are supported, got {factors!r}")
+    factors = tuple(int(f) for f in factors)
   else:
-    scales = (scale_factor,) * len(spatial_shape) if isinstance(scale_factor, (int, float)) else tuple(scale_factor)
-    output_shape = tuple(math.floor(input * scale) for input, scale in zip(spatial_shape, scales))
-    if recompute_scale_factor:
-      scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
-
-  result = _v(input)
-  for axis, (input_size, output_size, scale) in enumerate(zip(spatial_shape, output_shape, scales), start=2):
-    indices = jnp.floor(jnp.arange(output_size) / scale).astype(jnp.int32)
-    result = jnp.take(result, jnp.minimum(indices, input_size - 1), axis=axis)
-  return result
+    targets = tuple(size) if isinstance(size, (list, tuple)) else (size,) * len(spatial)
+    if len(targets) != len(spatial):
+      raise ValueError(f"interpolate: size length {len(targets)} != spatial dims {len(spatial)}")
+    if not builtins.all(t % s == 0 for t, s in zip(targets, spatial)):
+      raise NotImplementedError(f"interpolate: size {targets!r} must be an integer multiple of input size {spatial!r}")
+    factors = tuple(t // s for t, s in zip(targets, spatial))
+  # recompute_scale_factor is irrelevant here: with integer factors the recomputed
+  # output_size/input_size ratio is exactly the given factor again.
+  #
+  # For integer factor s, nearest and nearest-exact coincide: output index i reads
+  # source index floor(i/s) (nearest) vs floor((i+0.5)/s) (nearest-exact), and for
+  # i = k*s+r with 0 <= r < s both equal k, i.e. each source pixel repeats s times.
+  for i, f in enumerate(factors):
+    if f != 1:
+      x = jnp.repeat(x, f, axis=2 + i)
+  return x
 
 
 @implements(torch.nn.functional.linear)
