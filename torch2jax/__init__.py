@@ -187,15 +187,20 @@ class Torchish:
 
   def expand(self, *sizes):
     sizes = tuple(_coerce(size) for size in sizes)
-    assert len(sizes) == self.ndim, "TODO: implement len(sizes) > self.ndim"
-    newshape = [old if isinstance(new, Integral) and new == -1 else new for old, new in zip(self.shape, sizes)]
-    for i, (old, new) in enumerate(zip(self.shape, sizes)):
+    extra = len(sizes) - self.ndim
+    assert extra >= 0, f"expand received fewer sizes ({len(sizes)}) than tensor rank ({self.ndim})"
+    source_shape = (1,) * extra + tuple(self.shape)
+    newshape = []
+    for i, (old, new) in enumerate(zip(source_shape, sizes)):
+      keep_old = isinstance(new, Integral) and new == -1
+      assert not (keep_old and i < extra), "expand cannot use -1 for a new leading dimension"
+      target = old if keep_old else new
       if old != 1:
-        assert newshape[i] == old, (
-          f"Attempted to expand dimension {i} from {old} to {new}. Cannot expand on non-singleton dimensions."
+        assert target == old, (
+          f"Attempted to expand dimension {i} from {old} to {target}. Cannot expand on non-singleton dimensions."
         )
-
-    return Torchish(jnp.broadcast_to(self.value, newshape))
+      newshape.append(target)
+    return Torchish(jnp.broadcast_to(self.value.reshape(source_shape), newshape))
 
   # fmt: off
   def __add__(self, other): return Torchish(self.value + _coerce(other))
@@ -225,7 +230,9 @@ class Torchish:
   def __rmatmul__(self, other): return Torchish(_coerce(other) @ self.value)
   def __rmod__(self, other): return Torchish(_coerce(other) % self.value)
   def __rmul__(self, other): return Torchish(_coerce(other) * self.value)
+  def __rpow__(self, other): return Torchish(_coerce(other) ** self.value)
   def __rsub__(self, other): return Torchish(_coerce(other) - self.value)
+  def __rtruediv__(self, other): return Torchish(_coerce(other) / self.value)
   def __setitem__(self, key, value):
     self.value = self.value.at[torch_tree_map(_coerce, key)].set(_coerce(value))
   def __sub__(self, other): return Torchish(self.value - _coerce(other))
@@ -567,6 +574,13 @@ def bernoulli(input, generator=None):
 @implements(torch.bitwise_not, out_kwarg=True, Torchish_member=True)
 def bitwise_not(input):
   return jnp.invert(_v(input))
+
+
+@implements(torch.einsum)
+def einsum(equation, *operands):
+  if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+    operands = tuple(operands[0])
+  return jnp.einsum(equation, *[_v(op) for op in operands])
 
 
 @implements(torch.cat, out_kwarg=True)
