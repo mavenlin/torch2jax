@@ -64,6 +64,45 @@ def test_arange():
     test(lambda out=None: torch.arange(2, 10, 3, out=out), [])
 
 
+def test_python_reverse_power():
+  for shape in [(), (3,), (2, 3)]:
+    t2j_function_test(lambda x: 2.0**x, [shape], num_tests=1)
+
+
+def test_python_reverse_division():
+  samplers = [lambda rng, shape: random.uniform(rng, shape, minval=0.5, maxval=2.0)]
+  for shape in [(), (3,), (2, 3)]:
+    t2j_function_test(lambda x: 2.0 / x, [shape], samplers=samplers, num_tests=1)
+
+
+def test_expand():
+  cases = [
+    ((1, 3, 1), lambda x: x.expand(2, 3, 4)),
+    ((1, 2), lambda x: x.expand(5, 3, 2)),
+    ((1, 2), lambda x: x.expand((5, 3, -1))),
+    ((2, 3), lambda x: x.expand(-1, -1)),
+  ]
+  for shape, function in cases:
+    t2j_function_test(function, [shape], num_tests=1)
+
+  with pytest.raises(RuntimeError, match="number of sizes provided"):
+    t2j(lambda x: x.expand(3))(jnp.ones((2, 3)))
+  with pytest.raises(RuntimeError, match="leading, non-existing dimension"):
+    t2j(lambda x: x.expand(-1, 2, 3))(jnp.ones((2, 3)))
+
+
+def test_einsum():
+  cases = [
+    (lambda x: torch.einsum("ij->ji", x), [(2, 3)]),
+    (lambda x, y: torch.einsum("ij,jk->ik", x, y), [(2, 3), (3, 4)]),
+    (lambda x, y: torch.einsum("bij,bjk->bik", x, y), [(2, 3, 4), (2, 4, 5)]),
+    (lambda x, y: torch.einsum("i,j->ij", (x, y)), [(2,), (3,)]),
+    (lambda x, y: torch.einsum("i,j->ij", [x, y]), [(2,), (3,)]),
+  ]
+  for function, shapes in cases:
+    t2j_function_test(function, shapes, num_tests=1)
+
+
 def test_cast_to_scalar():
   # in future, we should have the __float__ and __int__ methods tested here.
   def f(x):
@@ -475,7 +514,6 @@ def test_oneliners():
   t2j_function_test(lambda x: x.permute(2, 0, 1), [(4, 3, 2)], tests=fb)
   t2j_function_test(lambda x: x.permute(dims=(2, 0, 1)), [(4, 3, 2)], tests=fb)
 
-  t2j_function_test(lambda x: x.expand(5, -1, -1), [(1, 3, 2)], tests=fb)
   t2j_function_test(lambda x: x.unflatten(1, (2, -1)), [(3, 8)], tests=fb)
   t2j_function_test(lambda x: x.repeat(2, 1), [(3, 5)], tests=fb)
   t2j_function_test(lambda x: torch.tile(x, (2, 1)), [(3, 5)], tests=fb)

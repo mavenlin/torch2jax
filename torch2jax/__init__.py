@@ -186,14 +186,22 @@ class Torchish:
     return False
 
   def expand(self, *sizes):
+    if len(sizes) == 1 and isinstance(sizes[0], Sequence):
+      sizes = sizes[0]
     sizes = tuple(_coerce(size) for size in sizes)
-    assert len(sizes) == self.ndim, "TODO: implement len(sizes) > self.ndim"
-    newshape = [old if isinstance(new, Integral) and new == -1 else new for old, new in zip(self.shape, sizes)]
-    for i, (old, new) in enumerate(zip(self.shape, sizes)):
-      if old != 1:
-        assert newshape[i] == old, (
-          f"Attempted to expand dimension {i} from {old} to {new}. Cannot expand on non-singleton dimensions."
-        )
+    if len(sizes) < self.ndim:
+      raise RuntimeError(
+        f"expand({sizes}): the number of sizes provided ({len(sizes)}) must be greater or equal to "
+        f"the number of dimensions in the tensor ({self.ndim})"
+      )
+    added_dims = len(sizes) - self.ndim
+    leading, trailing = sizes[:added_dims], sizes[added_dims:]
+    for size in leading:
+      if isinstance(size, Integral) and size == -1:
+        raise RuntimeError("expand: -1 is not allowed in a leading, non-existing dimension")
+    newshape = leading + tuple(
+      old if isinstance(new, Integral) and new == -1 else new for old, new in zip(self.shape, trailing)
+    )
 
     return Torchish(jnp.broadcast_to(self.value, newshape))
 
@@ -225,7 +233,9 @@ class Torchish:
   def __rmatmul__(self, other): return Torchish(_coerce(other) @ self.value)
   def __rmod__(self, other): return Torchish(_coerce(other) % self.value)
   def __rmul__(self, other): return Torchish(_coerce(other) * self.value)
+  def __rpow__(self, other): return Torchish(_coerce(other) ** self.value)
   def __rsub__(self, other): return Torchish(_coerce(other) - self.value)
+  def __rtruediv__(self, other): return Torchish(_coerce(other) / self.value)
   def __setitem__(self, key, value):
     self.value = self.value.at[torch_tree_map(_coerce, key)].set(_coerce(value))
   def __sub__(self, other): return Torchish(self.value - _coerce(other))
@@ -483,6 +493,13 @@ auto_implements(torch.cos, jnp.cos, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.clone, lambda x: x, Torchish_member=True)  # jax arrays are immutable, no copy needed
 auto_implements(torch.div, jnp.divide, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.exp, jnp.exp, out_kwarg=True, Torchish_member=True)
+
+
+@implements(torch.einsum)
+def einsum(equation, *operands):
+  if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+    operands = tuple(operands[0])
+  return jnp.einsum(equation, *(_coerce(operand) for operand in operands))
 
 
 @implements(torch.nn.functional.gelu)
