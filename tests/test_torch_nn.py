@@ -190,6 +190,26 @@ def test_torch_nn_functional_conv3d():
   )
 
 
+def test_torch_nn_functional_interpolate():
+  cpu = jax.devices("cpu")[0]
+  sampler = lambda key, shape: jax.device_put(random.normal(key, shape), cpu)
+  cases = [
+    ((2, 3, 4), dict(scale_factor=2.0, mode="nearest")),
+    ((2, 3, 4, 5), dict(scale_factor=(2.0, 3.0), mode="nearest")),
+    ((2, 3, 4, 5), dict(size=(7, 8), mode="nearest")),
+    ((2, 3, 2, 3, 4), dict(scale_factor=(2.0, 3.0, 2.0), mode="nearest")),
+  ]
+  for shape, kwargs in cases:
+    t2j_function_test(
+      torch.nn.functional.interpolate,
+      [shape],
+      kwargs=kwargs,
+      samplers=[sampler],
+      num_tests=1,
+      tests=[forward_test, partial(backward_test, argnums=(0,))],
+    )
+
+
 def test_torch_nn_ConvTranspose2d():
   for in_channels in [1, 2]:
     for out_channels in [1, 2]:

@@ -1664,6 +1664,43 @@ def group_norm(input, num_groups, weight=None, bias=None, eps=1e-05):
   return res
 
 
+@implements(torch.nn.functional.interpolate)
+def interpolate(
+  input,
+  size=None,
+  scale_factor=None,
+  mode="nearest",
+  align_corners=None,
+  recompute_scale_factor=None,
+  antialias=False,
+):
+  assert mode == "nearest", "TODO: implement modes other than nearest"
+  assert align_corners is None
+  assert not antialias
+  assert 3 <= input.ndim <= 5
+  assert (size is None) != (scale_factor is None)
+
+  spatial_shape = input.shape[2:]
+  if size is not None:
+    output_shape = (size,) * len(spatial_shape) if isinstance(size, int) else tuple(size)
+    scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
+  else:
+    scales = (
+      (scale_factor,) * len(spatial_shape)
+      if isinstance(scale_factor, (int, float))
+      else tuple(scale_factor)
+    )
+    output_shape = tuple(math.floor(input * scale) for input, scale in zip(spatial_shape, scales))
+    if recompute_scale_factor:
+      scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
+
+  result = _v(input)
+  for axis, (input_size, output_size, scale) in enumerate(zip(spatial_shape, output_shape, scales), start=2):
+    indices = jnp.floor(jnp.arange(output_size) / scale).astype(jnp.int32)
+    result = jnp.take(result, jnp.minimum(indices, input_size - 1), axis=axis)
+  return result
+
+
 @implements(torch.nn.functional.linear)
 def linear(input, weight, bias=None):
   if bias is None:
