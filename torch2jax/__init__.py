@@ -2184,11 +2184,28 @@ def j2t_dtype(dtype):
 
 
 def t2j_module(module, function_names=None, *, torch_function_overrides=None):
-  """Convert a torch.nn.Module to a flax.nnx.Module.
+  """Create a lazy constructor for a converted ``flax.nnx.Module``.
+
+  The returned callable captures ``module`` but does not convert its parameters
+  or buffers until the callable is invoked. This makes module conversion safe
+  to compose with NNX constructor transformations such as ``nnx.eval_shape``
+  and sharded initialization.
 
   ``torch_function_overrides`` applies only while invoking this converted
   module and takes precedence over torch2jax's default implementations.
   """
+
+  if not isinstance(module, torch.nn.Module):
+    raise TypeError(f"Expected torch.nn.Module, got {type(module)}")
+
+  if function_names is None:
+    function_names = ("__call__",)
+  elif isinstance(function_names, Sequence) and not isinstance(function_names, (str, bytes)):
+    function_names = tuple(function_names)
+  else:
+    raise TypeError(f"function_names must be a sequence of method names, got {function_names!r}")
+  if not builtins.all(isinstance(name, str) for name in function_names):
+    raise TypeError(f"function_names must contain only strings, got {function_names!r}")
 
   torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
 
@@ -2230,29 +2247,27 @@ def t2j_module(module, function_names=None, *, torch_function_overrides=None):
       visit(m, prefix=[])
       return m
 
-  jax_module = JaxModule(module)
-  if function_names is None:
-    function_names = ["__call__"]
-  if isinstance(function_names, Sequence):
-    for fn in function_names:
+  for fn in function_names:
 
-      def f(self, *args, _fn=fn, **kwargs):
-        original_f = getattr(self._prepare(), _fn)
-        return t2j_function(
-          original_f, torch_function_overrides=torch_function_overrides
-        )(*args, **kwargs)
+    def f(self, *args, _fn=fn, **kwargs):
+      original_f = getattr(self._prepare(), _fn)
+      return t2j_function(
+        original_f, torch_function_overrides=torch_function_overrides
+      )(*args, **kwargs)
 
-      setattr(JaxModule, fn, f)
-  else:
-    raise RuntimeError(f"function_names needs to be a list of function names, got {function_names}")
-  return jax_module
+    setattr(JaxModule, fn, f)
+
+  def initialize(*, rngs=None):
+    return JaxModule(module, rngs=rngs)
+
+  return initialize
 
 
 def t2j(thing, *, torch_function_overrides=None):
   if isinstance(thing, torch.Tensor):
     return t2j_array(thing)
   elif isinstance(thing, torch.nn.Module):
-    return t2j_module(thing, torch_function_overrides=torch_function_overrides)
+    return t2j_module(thing, torch_function_overrides=torch_function_overrides)()
   elif isinstance(thing, torch.device):
     return t2j_device(thing)
   elif isinstance(thing, torch.dtype):
