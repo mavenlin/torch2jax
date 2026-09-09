@@ -2263,11 +2263,20 @@ def t2j_lazy(module, function_names=None, *, torch_function_overrides=None):
   return initialize
 
 
+def t2j_module(module, function_names=None, *, torch_function_overrides=None):
+  """Convert a ``torch.nn.Module`` to an initialized ``flax.nnx.Module``."""
+  return t2j_lazy(
+    module,
+    function_names=function_names,
+    torch_function_overrides=torch_function_overrides,
+  )()
+
+
 def t2j(thing, *, torch_function_overrides=None):
   if isinstance(thing, torch.Tensor):
     return t2j_array(thing)
   elif isinstance(thing, torch.nn.Module):
-    return t2j_lazy(thing, torch_function_overrides=torch_function_overrides)()
+    return t2j_module(thing, torch_function_overrides=torch_function_overrides)
   elif isinstance(thing, torch.device):
     return t2j_device(thing)
   elif isinstance(thing, torch.dtype):

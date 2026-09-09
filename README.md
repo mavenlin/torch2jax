@@ -60,8 +60,8 @@ The constructor retains the source PyTorch module and may be called more than
 once to create independent NNX module state. Keeping the source module on CPU
 allows callers to defer accelerator allocation until their own sharded or
 transformed initialization boundary. For backward compatibility, the generic
-`t2j(torch_module)` API invokes this constructor and still returns an initialized
-NNX module.
+`t2j(torch_module)` and `t2j_module(torch_module)` APIs invoke this constructor
+and return an initialized NNX module.
 
 Internally, the core of torch2jax is `Torchish`, a class that mimics `torch.Tensor` via [`__torch_function__`](https://pytorch.org/docs/stable/notes/extending.html#operations-on-multiple-types-that-define-torch-function). A `Torchish` object is backed by a JAX `jax.numpy.ndarray`, and proxies PyTorch operations onto the underlying `jax.numpy.ndarray`. As a result, you get a JAX-native computation graph that exactly follows your PyTorch code.
 

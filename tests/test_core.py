@@ -11,7 +11,7 @@ from flax import nnx
 from jax import grad, jit, random, vmap
 from torch.overrides import handle_torch_function, has_torch_function
 
-from torch2jax import Torchish, j2t, t2j, t2j_lazy
+from torch2jax import Torchish, j2t, t2j, t2j_lazy, t2j_module
 
 from .utils import Torchish_member_test, aac, backward_test, forward_test, out_kwarg_test, t2j_function_test
 
@@ -56,6 +56,15 @@ def test_t2j_lazy_defers_conversion_until_constructor_call():
   assert torch_module.named_parameters_calls == 0
 
   jax_module = constructor()
+
+  assert isinstance(jax_module, nnx.Module)
+  assert torch_module.named_parameters_calls == 1
+
+
+def test_t2j_module_converts_immediately():
+  torch_module = ParameterAccessModule()
+
+  jax_module = t2j_module(torch_module)
 
   assert isinstance(jax_module, nnx.Module)
   assert torch_module.named_parameters_calls == 1
