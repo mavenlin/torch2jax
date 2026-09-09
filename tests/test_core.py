@@ -11,7 +11,7 @@ from flax import nnx
 from jax import grad, jit, random, vmap
 from torch.overrides import handle_torch_function, has_torch_function
 
-from torch2jax import Torchish, j2t, t2j, t2j_module
+from torch2jax import Torchish, j2t, t2j, t2j_lazy
 
 from .utils import Torchish_member_test, aac, backward_test, forward_test, out_kwarg_test, t2j_function_test
 
@@ -46,10 +46,10 @@ class ParameterAccessModule(torch.nn.Linear):
     return super().named_parameters(*args, **kwargs)
 
 
-def test_t2j_module_defers_conversion_until_constructor_call():
+def test_t2j_lazy_defers_conversion_until_constructor_call():
   torch_module = ParameterAccessModule()
 
-  constructor = t2j_module(torch_module)
+  constructor = t2j_lazy(torch_module)
 
   assert callable(constructor)
   assert not isinstance(constructor, nnx.Module)
@@ -61,8 +61,8 @@ def test_t2j_module_defers_conversion_until_constructor_call():
   assert torch_module.named_parameters_calls == 1
 
 
-def test_t2j_module_constructor_supports_nnx_eval_shape():
-  constructor = t2j_module(torch.nn.Linear(2, 3))
+def test_t2j_lazy_constructor_supports_nnx_eval_shape():
+  constructor = t2j_lazy(torch.nn.Linear(2, 3))
 
   abstract_module = nnx.eval_shape(constructor)
 
@@ -72,8 +72,8 @@ def test_t2j_module_constructor_supports_nnx_eval_shape():
   )
 
 
-def test_t2j_module_supports_abstract_calls_with_nnx_state():
-  module = t2j_module(torch.nn.Linear(2, 3))()
+def test_t2j_lazy_supports_abstract_calls_with_nnx_state():
+  module = t2j_lazy(torch.nn.Linear(2, 3))()
   inputs = jax.ShapeDtypeStruct((4, 2), jnp.float32)
 
   outputs = nnx.eval_shape(lambda model, value: model(value), module, inputs)
@@ -81,8 +81,8 @@ def test_t2j_module_supports_abstract_calls_with_nnx_state():
   assert outputs == jax.ShapeDtypeStruct((4, 3), jnp.float32)
 
 
-def test_t2j_module_constructor_creates_independent_state():
-  constructor = t2j_module(torch.nn.Linear(2, 3))
+def test_t2j_lazy_constructor_creates_independent_state():
+  constructor = t2j_lazy(torch.nn.Linear(2, 3))
   first = constructor()
   second = constructor()
   second_weight = second._params["weight"].get_value()
@@ -96,14 +96,14 @@ def test_t2j_module_constructor_creates_independent_state():
   )
 
 
-def test_t2j_module_scoped_torch_function_overrides():
+def test_t2j_lazy_scoped_torch_function_overrides():
   inputs = jnp.arange(4, dtype=jnp.float32)
   first_overrides = {custom_offset: lambda input: Torchish(input.value + 2)}
-  first = t2j_module(
+  first = t2j_lazy(
     CustomOffsetModule(),
     torch_function_overrides=first_overrides,
   )()
-  second = t2j_module(
+  second = t2j_lazy(
     CustomOffsetModule(),
     torch_function_overrides={custom_offset: lambda input: Torchish(input.value + 3)},
   )()
@@ -114,7 +114,7 @@ def test_t2j_module_scoped_torch_function_overrides():
   np.testing.assert_array_equal(jit(first)(inputs), inputs + 2)
   np.testing.assert_array_equal(grad(lambda x: first(x).sum())(inputs), jnp.ones_like(inputs))
   with pytest.raises(NotImplementedError, match="Unhandled function call"):
-    t2j_module(CustomOffsetModule())()(inputs)
+    t2j_lazy(CustomOffsetModule())()(inputs)
 
 
 def test_arange():

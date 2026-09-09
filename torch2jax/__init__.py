@@ -2183,7 +2183,7 @@ def j2t_dtype(dtype):
   return next(t_dtype for t_dtype, j_dtype in TJ_DTYPE_ASSOCIATION if j_dtype == dtype)
 
 
-def t2j_module(module, function_names=None, *, torch_function_overrides=None):
+def t2j_lazy(module, function_names=None, *, torch_function_overrides=None):
   """Create a lazy constructor for a converted ``flax.nnx.Module``.
 
   The returned callable captures ``module`` but does not convert its parameters
@@ -2267,7 +2267,7 @@ def t2j(thing, *, torch_function_overrides=None):
   if isinstance(thing, torch.Tensor):
     return t2j_array(thing)
   elif isinstance(thing, torch.nn.Module):
-    return t2j_module(thing, torch_function_overrides=torch_function_overrides)()
+    return t2j_lazy(thing, torch_function_overrides=torch_function_overrides)()
   elif isinstance(thing, torch.device):
     return t2j_device(thing)
   elif isinstance(thing, torch.dtype):

@@ -42,14 +42,14 @@ torch2jax offers a simple API with two functions:
 1. `j2t`: Convert a JAX `jax.numpy.ndarray` to a `torch.Tensor`.
 2. `t2j`: Convert a PyTorch function, `torch.nn.Module`, or `torch.Tensor` to their JAX equivalent.
 
-For explicit NNX module construction, `t2j_module` returns a lazy constructor:
+For deferred NNX module construction, `t2j_lazy` returns a lazy constructor:
 
 ```python
 from flax import nnx
-from torch2jax import t2j_module
+from torch2jax import t2j_lazy
 
 torch_model = torchvision.models.vit_b_16().eval().cpu()
-jax_model_constructor = t2j_module(torch_model)
+jax_model_constructor = t2j_lazy(torch_model)
 
 # No JAX parameters or buffers exist until the constructor is called.
 abstract_model = nnx.eval_shape(jax_model_constructor)
