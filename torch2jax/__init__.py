@@ -167,6 +167,10 @@ class Torchish:
     return torch.device("cpu")
 
   @property
+  def is_cuda(self):
+    return self.device.type == "cuda"
+
+  @property
   def dtype(self) -> torch.dtype: return j2t_dtype(self.value.dtype)
   @property
   def ndim(self) -> int: return len(self.value.shape)
@@ -326,6 +330,21 @@ class Torchish:
       assert len(shape) == 0, "Cannot pass both shape args and shape kwarg"
       shape = (kwargs["shape"],)
     return self.view(*shape)
+
+  def narrow(self, dim, start, length):
+    dim, start, length = index(dim), index(start), index(length)
+    if not -self.ndim <= dim < self.ndim:
+      raise IndexError(f"Dimension out of range: {dim}")
+    dim %= self.ndim
+    size = self.shape[dim]
+    if not -size <= start <= size or length < 0:
+      raise RuntimeError("narrow: invalid start or length")
+    start = start + size if start < 0 else start
+    if start + length > size:
+      raise RuntimeError("narrow: start + length exceeds dimension size")
+    slices = [slice(None)] * self.ndim
+    slices[dim] = slice(start, start + length)
+    return Torchish(self.value[tuple(slices)])
 
   def unfold(self, dimension, size, step):
     dimension, size, step = index(dimension), index(size), index(step)
@@ -1017,6 +1036,11 @@ def randperm(
 ):
   assert generator is None, "TODO: implement `generator`"
   return jax.random.permutation(mk_rng(), n).astype(dtype or torch.int64)
+
+
+@implements(torch.promote_types, Torchishify_output=False)
+def promote_types(type1: torch.dtype, type2: torch.dtype) -> torch.dtype:
+  return torch.promote_types(type1, type2)
 
 
 @implements(torch._C._set_grad_enabled, Torchishify_output=False)
@@ -2174,8 +2198,9 @@ def t2j_function(f, *, torch_function_overrides=None):
   )
 
   def f_jax(*args, rng=None, **kwargs):
-    torch_args = jax.tree.map(Torchish, args)
-    torch_kwargs = jax.tree.map(Torchish, kwargs)
+    wrap = lambda value: value if isinstance(value, (str, bytes)) else Torchish(value)
+    torch_args = jax.tree.map(wrap, args)
+    torch_kwargs = jax.tree.map(wrap, kwargs)
     with override_Tensor_constructor():
       with override_torch_constructors(torch_function_overrides):
         with RngPooperContext(None if rng is None else RngPooper(rng)):
@@ -2301,11 +2326,13 @@ def t2j_module(module, function_names=None, *, torch_function_overrides=None):
   )()
 
 
-def t2j(thing, *, torch_function_overrides=None):
+def t2j(thing, *, function_names=None, torch_function_overrides=None):
+  if function_names is not None and not isinstance(thing, torch.nn.Module):
+    raise TypeError("function_names is only supported for torch.nn.Module")
   if isinstance(thing, torch.Tensor):
     return t2j_array(thing)
   elif isinstance(thing, torch.nn.Module):
-    return t2j_module(thing, torch_function_overrides=torch_function_overrides)
+    return t2j_module(thing, function_names=function_names, torch_function_overrides=torch_function_overrides)
   elif isinstance(thing, torch.device):
     return t2j_device(thing)
   elif isinstance(thing, torch.dtype):

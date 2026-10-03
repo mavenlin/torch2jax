@@ -70,6 +70,17 @@ def test_t2j_module_converts_immediately():
   assert torch_module.named_parameters_calls == 1
 
 
+def test_t2j_converts_named_module_method():
+  source = torch.nn.Linear(2, 3)
+  converted = t2j(source, function_names=["forward"])
+  inputs = torch.ones(4, 2)
+  np.testing.assert_allclose(
+    jax.jit(converted.forward)(jnp.asarray(inputs.numpy())),
+    source(inputs).detach().numpy(),
+    rtol=1e-6, atol=1e-6,
+  )
+
+
 def test_t2j_lazy_constructor_supports_nnx_eval_shape():
   constructor = t2j_lazy(torch.nn.Linear(2, 3))
 
