@@ -179,7 +179,7 @@ def test_einsum():
     (lambda x, y: torch.einsum("i,j->ij", [x, y]), [(2,), (3,)]),
   ]
   for function, shapes in cases:
-    t2j_function_test(function, shapes, num_tests=1)
+    t2j_function_test(function, shapes, num_tests=1, atol=1e-8)
 
 
 def test_cast_to_scalar():
