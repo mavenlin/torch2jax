@@ -130,10 +130,7 @@ def _freeze_torch_function_overrides(overrides):
   if overrides is None:
     return _EMPTY_TORCH_FUNCTION_OVERRIDES
   frozen = dict(overrides)
-  if not builtins.all(
-    callable(function) and callable(implementation)
-    for function, implementation in frozen.items()
-  ):
+  if not builtins.all(callable(function) and callable(implementation) for function, implementation in frozen.items()):
     raise TypeError("torch_function_overrides must map callables to callables")
   return MappingProxyType(frozen)
 
@@ -362,12 +359,12 @@ class Torchish:
       return Torchish(value[:size])
     windows = (length - size) // step + 1
     if size == 0:
-      shape = value.shape[:dimension] + (windows,) + value.shape[dimension + 1:] + (0,)
+      shape = value.shape[:dimension] + (windows,) + value.shape[dimension + 1 :] + (0,)
       return Torchish(jnp.zeros(shape, dtype=value.dtype))
     if step == size:
       slices = [slice(None)] * ndim
       slices[dimension] = slice(0, windows * size)
-      shape = value.shape[:dimension] + (windows, size) + value.shape[dimension + 1:]
+      shape = value.shape[:dimension] + (windows, size) + value.shape[dimension + 1 :]
       value = value[tuple(slices)].reshape(shape)
       return Torchish(jnp.moveaxis(value, dimension + 1, -1))
     indices = jnp.arange(windows)[:, None] * step + jnp.arange(size)[None, :]
@@ -1738,11 +1735,7 @@ def interpolate(
     output_shape = (size,) * len(spatial_shape) if isinstance(size, int) else tuple(size)
     scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
   else:
-    scales = (
-      (scale_factor,) * len(spatial_shape)
-      if isinstance(scale_factor, (int, float))
-      else tuple(scale_factor)
-    )
+    scales = (scale_factor,) * len(spatial_shape) if isinstance(scale_factor, (int, float)) else tuple(scale_factor)
     output_shape = tuple(math.floor(input * scale) for input, scale in zip(spatial_shape, scales))
     if recompute_scale_factor:
       scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
@@ -2002,11 +1995,7 @@ def scaled_dot_product_attention(
     else:
       raise ValueError(f"Unsupported attn_mask dtype: {attn_mask.dtype}. Expected bool or float.")
   head_dim = Q.shape[-1]
-  use_cudnn = (
-    jax.default_backend() == "gpu"
-    and head_dim <= 256
-    and head_dim % 8 == 0
-  )
+  use_cudnn = jax.default_backend() == "gpu" and head_dim <= 256 and head_dim % 8 == 0
   if use_cudnn:
     from jax._src.cudnn.fused_attention_stablehlo import MaskType
     from jax._src.nn.functions import cudnn_dot_product_attention
@@ -2114,19 +2103,11 @@ def multi_head_attention_forward(
 
   # print(Q1.shape, K1.shape, V1.shape)  # (N, L, E) (N, S, E) (N, S, E)
   head_dim = embed_dim_to_check // num_heads
-  q = jnp.swapaxes(
-    jnp.reshape(Q1, (Q1.shape[0], Q1.shape[1], num_heads, head_dim)), 1, 2
-  )
-  k = jnp.swapaxes(
-    jnp.reshape(K1, (K1.shape[0], K1.shape[1], num_heads, head_dim)), 1, 2
-  )
-  v = jnp.swapaxes(
-    jnp.reshape(V1, (V1.shape[0], V1.shape[1], num_heads, head_dim)), 1, 2
-  )
+  q = jnp.swapaxes(jnp.reshape(Q1, (Q1.shape[0], Q1.shape[1], num_heads, head_dim)), 1, 2)
+  k = jnp.swapaxes(jnp.reshape(K1, (K1.shape[0], K1.shape[1], num_heads, head_dim)), 1, 2)
+  v = jnp.swapaxes(jnp.reshape(V1, (V1.shape[0], V1.shape[1], num_heads, head_dim)), 1, 2)
   sdpa = _v(scaled_dot_product_attention(Torchish(q), Torchish(k), Torchish(v)))
-  sdpa = jnp.reshape(
-    jnp.swapaxes(sdpa, 1, 2), (Q1.shape[0], Q1.shape[1], embed_dim_to_check)
-  )
+  sdpa = jnp.reshape(jnp.swapaxes(sdpa, 1, 2), (Q1.shape[0], Q1.shape[1], embed_dim_to_check))
   # print(sdpa.shape)  # (N, L, E)
   out = sdpa @ out_proj_weight.T + out_proj_bias
   return Torchish(jnp.swapaxes(out, 0, 1)), None
@@ -2134,18 +2115,14 @@ def multi_head_attention_forward(
 
 class TorchishMode(TorchFunctionMode):
   def __init__(self, torch_function_overrides=None):
-    self.torch_function_overrides = _freeze_torch_function_overrides(
-      torch_function_overrides
-    )
+    self.torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
 
   def __torch_function__(self, func, types, args, kwargs=None):
     # print(f"Function Log: {resolve_name(func)}(*{args}, **{kwargs}) with types {types}")
 
     kwargs = kwargs or {}
 
-    implementation = self.torch_function_overrides.get(
-      func, HANDLED_FUNCTIONS.get(func)
-    )
+    implementation = self.torch_function_overrides.get(func, HANDLED_FUNCTIONS.get(func))
     if implementation is not None:
       return implementation(*args, **kwargs)
     else:
@@ -2176,16 +2153,10 @@ def override_Tensor_constructor():
 
 @contextmanager
 def override_torch_constructors(torch_function_overrides=None):
-  torch_function_overrides = _freeze_torch_function_overrides(
-    torch_function_overrides
-  )
+  torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
   original_arange, original_zeros = torch.arange, torch.zeros
-  torch.arange = torch_function_overrides.get(
-    original_arange, HANDLED_FUNCTIONS[original_arange]
-  )
-  torch.zeros = torch_function_overrides.get(
-    original_zeros, HANDLED_FUNCTIONS[original_zeros]
-  )
+  torch.arange = torch_function_overrides.get(original_arange, HANDLED_FUNCTIONS[original_arange])
+  torch.zeros = torch_function_overrides.get(original_zeros, HANDLED_FUNCTIONS[original_zeros])
   try:
     yield
   finally:
@@ -2193,9 +2164,7 @@ def override_torch_constructors(torch_function_overrides=None):
 
 
 def t2j_function(f, *, torch_function_overrides=None):
-  torch_function_overrides = _freeze_torch_function_overrides(
-    torch_function_overrides
-  )
+  torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
 
   def f_jax(*args, rng=None, **kwargs):
     wrap = lambda value: value if isinstance(value, (str, bytes)) else Torchish(value)
@@ -2305,9 +2274,7 @@ def t2j_lazy(module, function_names=None, *, torch_function_overrides=None):
 
     def f(self, *args, _fn=fn, **kwargs):
       original_f = getattr(self._prepare(), _fn)
-      return t2j_function(
-        original_f, torch_function_overrides=torch_function_overrides
-      )(*args, **kwargs)
+      return t2j_function(original_f, torch_function_overrides=torch_function_overrides)(*args, **kwargs)
 
     setattr(JaxModule, fn, f)
 

@@ -21,8 +21,10 @@ dependencies = ["einops", "flax", "jax", "torch"]
 packages = ["torch2jax"]
 
 [tool.ruff]
-# Enable the isort rules. See https://github.com/astral-sh/ruff/issues/465#issuecomment-1783684428.
-lint.extend-select = ["I"]
+# Ruff 0.16 began formatting fenced Python snippets in Markdown files.
+extend-exclude = ["*.md"]
+# Keep the lint rule families stable as the CI Nix channel updates Ruff.
+lint.select = ["E4", "E7", "E9", "F", "I"]
 
 # E731 Do not assign a `lambda` expression, use a `def`
 lint.ignore = ["E731"]

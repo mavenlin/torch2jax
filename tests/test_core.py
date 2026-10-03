@@ -77,7 +77,8 @@ def test_t2j_converts_named_module_method():
   np.testing.assert_allclose(
     jax.jit(converted.forward)(jnp.asarray(inputs.numpy())),
     source(inputs).detach().numpy(),
-    rtol=1e-6, atol=1e-6,
+    rtol=1e-6,
+    atol=1e-6,
   )
 
 
@@ -86,10 +87,7 @@ def test_t2j_lazy_constructor_supports_nnx_eval_shape():
 
   abstract_module = nnx.eval_shape(constructor)
 
-  assert all(
-    isinstance(value, jax.ShapeDtypeStruct)
-    for value in jax.tree.leaves(nnx.state(abstract_module))
-  )
+  assert all(isinstance(value, jax.ShapeDtypeStruct) for value in jax.tree.leaves(nnx.state(abstract_module)))
 
 
 def test_t2j_lazy_supports_abstract_calls_with_nnx_state():
