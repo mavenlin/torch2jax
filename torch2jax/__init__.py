@@ -6,6 +6,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from numbers import Integral
+from operator import index
 from types import MappingProxyType
 from typing import Literal, Optional, Sequence, Tuple, Union
 
@@ -129,10 +130,7 @@ def _freeze_torch_function_overrides(overrides):
   if overrides is None:
     return _EMPTY_TORCH_FUNCTION_OVERRIDES
   frozen = dict(overrides)
-  if not builtins.all(
-    callable(function) and callable(implementation)
-    for function, implementation in frozen.items()
-  ):
+  if not builtins.all(callable(function) and callable(implementation) for function, implementation in frozen.items()):
     raise TypeError("torch_function_overrides must map callables to callables")
   return MappingProxyType(frozen)
 
@@ -164,6 +162,10 @@ class Torchish:
   @property
   def device(self):
     return torch.device("cpu")
+
+  @property
+  def is_cuda(self):
+    return self.device.type == "cuda"
 
   @property
   def dtype(self) -> torch.dtype: return j2t_dtype(self.value.dtype)
@@ -325,6 +327,49 @@ class Torchish:
       assert len(shape) == 0, "Cannot pass both shape args and shape kwarg"
       shape = (kwargs["shape"],)
     return self.view(*shape)
+
+  def narrow(self, dim, start, length):
+    dim, start, length = index(dim), index(start), index(length)
+    if not -self.ndim <= dim < self.ndim:
+      raise IndexError(f"Dimension out of range: {dim}")
+    dim %= self.ndim
+    size = self.shape[dim]
+    if not -size <= start <= size or length < 0:
+      raise RuntimeError("narrow: invalid start or length")
+    start = start + size if start < 0 else start
+    if start + length > size:
+      raise RuntimeError("narrow: start + length exceeds dimension size")
+    slices = [slice(None)] * self.ndim
+    slices[dim] = slice(start, start + length)
+    return Torchish(self.value[tuple(slices)])
+
+  def unfold(self, dimension, size, step):
+    dimension, size, step = index(dimension), index(size), index(step)
+    ndim = self.ndim or 1
+    if not -ndim <= dimension < ndim:
+      raise IndexError(f"Dimension out of range: {dimension}")
+    dimension %= ndim
+    value = self.value.reshape((1,)) if self.ndim == 0 else self.value
+    length = value.shape[dimension]
+    if size < 0 or size > length:
+      raise RuntimeError(f"unfold: size {size} must be between 0 and {length}")
+    if step <= 0:
+      raise RuntimeError("unfold: step must be greater than zero")
+    if self.ndim == 0:
+      return Torchish(value[:size])
+    windows = (length - size) // step + 1
+    if size == 0:
+      shape = value.shape[:dimension] + (windows,) + value.shape[dimension + 1 :] + (0,)
+      return Torchish(jnp.zeros(shape, dtype=value.dtype))
+    if step == size:
+      slices = [slice(None)] * ndim
+      slices[dimension] = slice(0, windows * size)
+      shape = value.shape[:dimension] + (windows, size) + value.shape[dimension + 1 :]
+      value = value[tuple(slices)].reshape(shape)
+      return Torchish(jnp.moveaxis(value, dimension + 1, -1))
+    indices = jnp.arange(windows)[:, None] * step + jnp.arange(size)[None, :]
+    value = jnp.take(value, indices, axis=dimension)
+    return Torchish(jnp.moveaxis(value, dimension + 1, -1))
 
   def bernoulli_(self, p=0.5):
     # Torch accepts ints, floats, and even torch.Tensor's for p, but jax.numpy only accepts floats, so we convert.
@@ -988,6 +1033,11 @@ def randperm(
 ):
   assert generator is None, "TODO: implement `generator`"
   return jax.random.permutation(mk_rng(), n).astype(dtype or torch.int64)
+
+
+@implements(torch.promote_types, Torchishify_output=False)
+def promote_types(type1: torch.dtype, type2: torch.dtype) -> torch.dtype:
+  return torch.promote_types(type1, type2)
 
 
 @implements(torch._C._set_grad_enabled, Torchishify_output=False)
@@ -1685,11 +1735,7 @@ def interpolate(
     output_shape = (size,) * len(spatial_shape) if isinstance(size, int) else tuple(size)
     scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
   else:
-    scales = (
-      (scale_factor,) * len(spatial_shape)
-      if isinstance(scale_factor, (int, float))
-      else tuple(scale_factor)
-    )
+    scales = (scale_factor,) * len(spatial_shape) if isinstance(scale_factor, (int, float)) else tuple(scale_factor)
     output_shape = tuple(math.floor(input * scale) for input, scale in zip(spatial_shape, scales))
     if recompute_scale_factor:
       scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
@@ -1949,11 +1995,7 @@ def scaled_dot_product_attention(
     else:
       raise ValueError(f"Unsupported attn_mask dtype: {attn_mask.dtype}. Expected bool or float.")
   head_dim = Q.shape[-1]
-  use_cudnn = (
-    jax.default_backend() == "gpu"
-    and head_dim <= 256
-    and head_dim % 8 == 0
-  )
+  use_cudnn = jax.default_backend() == "gpu" and head_dim <= 256 and head_dim % 8 == 0
   if use_cudnn:
     from jax._src.cudnn.fused_attention_stablehlo import MaskType
     from jax._src.nn.functions import cudnn_dot_product_attention
@@ -2061,19 +2103,11 @@ def multi_head_attention_forward(
 
   # print(Q1.shape, K1.shape, V1.shape)  # (N, L, E) (N, S, E) (N, S, E)
   head_dim = embed_dim_to_check // num_heads
-  q = jnp.swapaxes(
-    jnp.reshape(Q1, (Q1.shape[0], Q1.shape[1], num_heads, head_dim)), 1, 2
-  )
-  k = jnp.swapaxes(
-    jnp.reshape(K1, (K1.shape[0], K1.shape[1], num_heads, head_dim)), 1, 2
-  )
-  v = jnp.swapaxes(
-    jnp.reshape(V1, (V1.shape[0], V1.shape[1], num_heads, head_dim)), 1, 2
-  )
+  q = jnp.swapaxes(jnp.reshape(Q1, (Q1.shape[0], Q1.shape[1], num_heads, head_dim)), 1, 2)
+  k = jnp.swapaxes(jnp.reshape(K1, (K1.shape[0], K1.shape[1], num_heads, head_dim)), 1, 2)
+  v = jnp.swapaxes(jnp.reshape(V1, (V1.shape[0], V1.shape[1], num_heads, head_dim)), 1, 2)
   sdpa = _v(scaled_dot_product_attention(Torchish(q), Torchish(k), Torchish(v)))
-  sdpa = jnp.reshape(
-    jnp.swapaxes(sdpa, 1, 2), (Q1.shape[0], Q1.shape[1], embed_dim_to_check)
-  )
+  sdpa = jnp.reshape(jnp.swapaxes(sdpa, 1, 2), (Q1.shape[0], Q1.shape[1], embed_dim_to_check))
   # print(sdpa.shape)  # (N, L, E)
   out = sdpa @ out_proj_weight.T + out_proj_bias
   return Torchish(jnp.swapaxes(out, 0, 1)), None
@@ -2081,18 +2115,14 @@ def multi_head_attention_forward(
 
 class TorchishMode(TorchFunctionMode):
   def __init__(self, torch_function_overrides=None):
-    self.torch_function_overrides = _freeze_torch_function_overrides(
-      torch_function_overrides
-    )
+    self.torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
 
   def __torch_function__(self, func, types, args, kwargs=None):
     # print(f"Function Log: {resolve_name(func)}(*{args}, **{kwargs}) with types {types}")
 
     kwargs = kwargs or {}
 
-    implementation = self.torch_function_overrides.get(
-      func, HANDLED_FUNCTIONS.get(func)
-    )
+    implementation = self.torch_function_overrides.get(func, HANDLED_FUNCTIONS.get(func))
     if implementation is not None:
       return implementation(*args, **kwargs)
     else:
@@ -2123,16 +2153,10 @@ def override_Tensor_constructor():
 
 @contextmanager
 def override_torch_constructors(torch_function_overrides=None):
-  torch_function_overrides = _freeze_torch_function_overrides(
-    torch_function_overrides
-  )
+  torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
   original_arange, original_zeros = torch.arange, torch.zeros
-  torch.arange = torch_function_overrides.get(
-    original_arange, HANDLED_FUNCTIONS[original_arange]
-  )
-  torch.zeros = torch_function_overrides.get(
-    original_zeros, HANDLED_FUNCTIONS[original_zeros]
-  )
+  torch.arange = torch_function_overrides.get(original_arange, HANDLED_FUNCTIONS[original_arange])
+  torch.zeros = torch_function_overrides.get(original_zeros, HANDLED_FUNCTIONS[original_zeros])
   try:
     yield
   finally:
@@ -2140,13 +2164,12 @@ def override_torch_constructors(torch_function_overrides=None):
 
 
 def t2j_function(f, *, torch_function_overrides=None):
-  torch_function_overrides = _freeze_torch_function_overrides(
-    torch_function_overrides
-  )
+  torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
 
   def f_jax(*args, rng=None, **kwargs):
-    torch_args = jax.tree.map(Torchish, args)
-    torch_kwargs = jax.tree.map(Torchish, kwargs)
+    wrap = lambda value: value if isinstance(value, (str, bytes)) else Torchish(value)
+    torch_args = jax.tree.map(wrap, args)
+    torch_kwargs = jax.tree.map(wrap, kwargs)
     with override_Tensor_constructor():
       with override_torch_constructors(torch_function_overrides):
         with RngPooperContext(None if rng is None else RngPooper(rng)):
@@ -2251,9 +2274,7 @@ def t2j_lazy(module, function_names=None, *, torch_function_overrides=None):
 
     def f(self, *args, _fn=fn, **kwargs):
       original_f = getattr(self._prepare(), _fn)
-      return t2j_function(
-        original_f, torch_function_overrides=torch_function_overrides
-      )(*args, **kwargs)
+      return t2j_function(original_f, torch_function_overrides=torch_function_overrides)(*args, **kwargs)
 
     setattr(JaxModule, fn, f)
 
@@ -2272,11 +2293,13 @@ def t2j_module(module, function_names=None, *, torch_function_overrides=None):
   )()
 
 
-def t2j(thing, *, torch_function_overrides=None):
+def t2j(thing, *, function_names=None, torch_function_overrides=None):
+  if function_names is not None and not isinstance(thing, torch.nn.Module):
+    raise TypeError("function_names is only supported for torch.nn.Module")
   if isinstance(thing, torch.Tensor):
     return t2j_array(thing)
   elif isinstance(thing, torch.nn.Module):
-    return t2j_module(thing, torch_function_overrides=torch_function_overrides)
+    return t2j_module(thing, function_names=function_names, torch_function_overrides=torch_function_overrides)
   elif isinstance(thing, torch.device):
     return t2j_device(thing)
   elif isinstance(thing, torch.dtype):

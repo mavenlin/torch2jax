@@ -70,15 +70,24 @@ def test_t2j_module_converts_immediately():
   assert torch_module.named_parameters_calls == 1
 
 
+def test_t2j_converts_named_module_method():
+  source = torch.nn.Linear(2, 3)
+  converted = t2j(source, function_names=["forward"])
+  inputs = torch.ones(4, 2)
+  np.testing.assert_allclose(
+    jax.jit(converted.forward)(jnp.asarray(inputs.numpy())),
+    source(inputs).detach().numpy(),
+    rtol=1e-6,
+    atol=1e-6,
+  )
+
+
 def test_t2j_lazy_constructor_supports_nnx_eval_shape():
   constructor = t2j_lazy(torch.nn.Linear(2, 3))
 
   abstract_module = nnx.eval_shape(constructor)
 
-  assert all(
-    isinstance(value, jax.ShapeDtypeStruct)
-    for value in jax.tree.leaves(nnx.state(abstract_module))
-  )
+  assert all(isinstance(value, jax.ShapeDtypeStruct) for value in jax.tree.leaves(nnx.state(abstract_module)))
 
 
 def test_t2j_lazy_supports_abstract_calls_with_nnx_state():
@@ -170,7 +179,7 @@ def test_einsum():
     (lambda x, y: torch.einsum("i,j->ij", [x, y]), [(2,), (3,)]),
   ]
   for function, shapes in cases:
-    t2j_function_test(function, shapes, num_tests=1)
+    t2j_function_test(function, shapes, num_tests=1, atol=1e-8)
 
 
 def test_cast_to_scalar():

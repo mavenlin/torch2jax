@@ -1,4 +1,6 @@
+import jax
 import jax.numpy as jnp
+import pytest
 import torch
 
 from torch2jax import j2t, t2j
@@ -77,3 +79,24 @@ def test_j2t_array_conversion():
   assert j2t(jnp.array(0.0, dtype=jnp.complex64)).dtype == torch.complex64
   # assert j2t(jnp.array(0.0, dtype=jnp.complex128)).dtype == torch.complex128  # requires jax_enable_x64
   assert j2t(jnp.array(0.0, dtype=jnp.bfloat16)).dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize(
+  "left,right",
+  [
+    (torch.bfloat16, torch.bfloat16),
+    (torch.float16, torch.bfloat16),
+    (torch.bfloat16, torch.float32),
+    (torch.int16, torch.float32),
+    (torch.uint8, torch.int16),
+  ],
+)
+def test_promote_types_in_converted_function(left, right):
+  def add(x, y):
+    return x.to(torch.promote_types(x.dtype, y.dtype)) + y
+
+  x, y = torch.ones(3, dtype=left), torch.ones(3, dtype=right)
+  expected = add(x, y)
+  actual = jax.jit(t2j(add))(t2j(x), t2j(y))
+  assert actual.dtype == t2j(expected.dtype)
+  assert jnp.array_equal(actual, t2j(expected))
