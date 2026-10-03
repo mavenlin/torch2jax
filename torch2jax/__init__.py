@@ -6,6 +6,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from numbers import Integral
+from operator import index
 from types import MappingProxyType
 from typing import Literal, Optional, Sequence, Tuple, Union
 
@@ -325,6 +326,34 @@ class Torchish:
       assert len(shape) == 0, "Cannot pass both shape args and shape kwarg"
       shape = (kwargs["shape"],)
     return self.view(*shape)
+
+  def unfold(self, dimension, size, step):
+    dimension, size, step = index(dimension), index(size), index(step)
+    ndim = self.ndim or 1
+    if not -ndim <= dimension < ndim:
+      raise IndexError(f"Dimension out of range: {dimension}")
+    dimension %= ndim
+    value = self.value.reshape((1,)) if self.ndim == 0 else self.value
+    length = value.shape[dimension]
+    if size < 0 or size > length:
+      raise RuntimeError(f"unfold: size {size} must be between 0 and {length}")
+    if step <= 0:
+      raise RuntimeError("unfold: step must be greater than zero")
+    if self.ndim == 0:
+      return Torchish(value[:size])
+    windows = (length - size) // step + 1
+    if size == 0:
+      shape = value.shape[:dimension] + (windows,) + value.shape[dimension + 1:] + (0,)
+      return Torchish(jnp.zeros(shape, dtype=value.dtype))
+    if step == size:
+      slices = [slice(None)] * ndim
+      slices[dimension] = slice(0, windows * size)
+      shape = value.shape[:dimension] + (windows, size) + value.shape[dimension + 1:]
+      value = value[tuple(slices)].reshape(shape)
+      return Torchish(jnp.moveaxis(value, dimension + 1, -1))
+    indices = jnp.arange(windows)[:, None] * step + jnp.arange(size)[None, :]
+    value = jnp.take(value, indices, axis=dimension)
+    return Torchish(jnp.moveaxis(value, dimension + 1, -1))
 
   def bernoulli_(self, p=0.5):
     # Torch accepts ints, floats, and even torch.Tensor's for p, but jax.numpy only accepts floats, so we convert.
