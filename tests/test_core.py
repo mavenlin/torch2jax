@@ -706,7 +706,7 @@ def test_Tensor():
   with pytest.raises(ValueError):
     t2j(lambda: torch.Tensor([1, 2, 3]))()
 
-  # Test that original torch.Tensor.__new__ implementation is restored
+  # The constructor still works normally outside conversion.
   aac(torch.Tensor([1, 2, 3]), jnp.array([1, 2, 3]))
 
 

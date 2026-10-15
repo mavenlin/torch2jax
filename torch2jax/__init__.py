@@ -4,9 +4,11 @@ import functools
 import math
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import is_dataclass
 from numbers import Integral
 from operator import index
+from threading import Lock
 from types import MappingProxyType
 from typing import Literal, Optional, Sequence, Tuple, Union
 
@@ -41,25 +43,26 @@ class RngPooper:
     return rng_key
 
 
-_RNG_POOPER_STACK = []
+_RNG_POOPER_STACK = ContextVar("torch2jax_rng_pooper_stack", default=())
 _is_symbolic_dim = getattr(getattr(jax, "export", None), "is_symbolic_dim", lambda x: False)
 
 
 def mk_rng() -> jax.random.PRNGKey:
-  assert len(_RNG_POOPER_STACK) > 0, "Attempted `mk_rng()` outside of a `RngPooperContext`"
-  assert _RNG_POOPER_STACK[-1] is not None, (
+  stack = _RNG_POOPER_STACK.get()
+  assert len(stack) > 0, "Attempted `mk_rng()` outside of a `RngPooperContext`"
+  assert stack[-1] is not None, (
     "Attempted `mk_rng()` with a `None` `RngPooperContext`. You're probably seeing this error message because you forgot to include a `rng` kwarg in your function call: `t2j(f)(..., rng=jax.random.PRNGKey(0))`. "
   )
-  return _RNG_POOPER_STACK[-1].poop()
+  return stack[-1].poop()
 
 
 @contextmanager
 def RngPooperContext(value: RngPooper | None):
-  _RNG_POOPER_STACK.append(value)
+  token = _RNG_POOPER_STACK.set((*_RNG_POOPER_STACK.get(), value))
   try:
     yield
   finally:
-    _RNG_POOPER_STACK.pop()
+    _RNG_POOPER_STACK.reset(token)
 
 
 def t2j_array(torch_array):
@@ -124,12 +127,17 @@ def j2t_device(device):
 
 HANDLED_FUNCTIONS = {}
 _EMPTY_TORCH_FUNCTION_OVERRIDES = MappingProxyType({})
+_CONSTRUCTOR_OVERRIDES = ContextVar("torch2jax_constructor_overrides", default=None)
+_CONSTRUCTOR_ORIGINALS = {}
 
 
 def _freeze_torch_function_overrides(overrides):
   if overrides is None:
     return _EMPTY_TORCH_FUNCTION_OVERRIDES
-  frozen = dict(overrides)
+  frozen = {
+    _CONSTRUCTOR_ORIGINALS.get(function, function): implementation
+    for function, implementation in dict(overrides).items()
+  }
   if not builtins.all(callable(function) and callable(implementation) for function, implementation in frozen.items()):
     raise TypeError("torch_function_overrides must map callables to callables")
   return MappingProxyType(frozen)
@@ -422,6 +430,9 @@ def _coerce(x):
     )
 
 
+_PYTREE_REGISTRATION_LOCK = Lock()
+
+
 def _tree_coerce(x):
   spec = torch_tree_structure(x)
   specs = deque([spec])
@@ -431,22 +442,23 @@ def _tree_coerce(x):
     specs.extend(spec.children())
     if spec.is_leaf():
       continue
-    if spec.type in jax._src.tree_util._registry:
-      continue  # already registered
-    node = torch.utils._pytree.SUPPORTED_NODES.get(spec.type, None)
-    if node is None:
-      continue
-    if is_dataclass(spec.type):
-      jax.tree_util.register_dataclass(spec.type)
-    else:
-      jax.tree_util.register_pytree_node(
-        spec.type,
-        node.flatten_fn,
-        lambda a, b, n=node: n.unflatten_fn(b, a),  # torch & jax have different order of args
-        # flatten_with_keys_func=node.flatten_with_keys_fn,
-        # TODO: flatten_with_keys has some problem as jax & torch has different class for key
-        # without registering it seems to just work as well.
-      )
+    with _PYTREE_REGISTRATION_LOCK:
+      if spec.type in jax._src.tree_util._registry:
+        continue  # already registered
+      node = torch.utils._pytree.SUPPORTED_NODES.get(spec.type, None)
+      if node is None:
+        continue
+      if is_dataclass(spec.type):
+        jax.tree_util.register_dataclass(spec.type)
+      else:
+        jax.tree_util.register_pytree_node(
+          spec.type,
+          node.flatten_fn,
+          lambda a, b, n=node: n.unflatten_fn(b, a),  # torch & jax have different order of args
+          # flatten_with_keys_func=node.flatten_with_keys_fn,
+          # TODO: flatten_with_keys has some problem as jax & torch has different class for key
+          # without registering it seems to just work as well.
+        )
 
   return jax.tree.map(_coerce, x)
 
@@ -2131,38 +2143,6 @@ class TorchishMode(TorchFunctionMode):
       )
 
 
-@contextmanager
-def override_Tensor_constructor():
-  """Context manager to temporarily override torch.Tensor.__new__ construction
-  while preserving isinstance checks and inheritance."""
-  original_new = torch.Tensor.__new__
-
-  @functools.wraps(original_new)
-  def custom_new(cls, *args, **kwargs):
-    raise ValueError(
-      "Attempted to call `torch.Tensor.__new__`. You're probably seeing this error message because you called `torch.Tensor(...)` instead of `torch.tensor(...)` (note capitalization!). The `torch.Tensor(...)` constructor is deprecated and does not work with __torch_function__ and torch2jax. Please migrate to `torch.tensor(...)`."
-    )
-
-  torch.Tensor.__new__ = custom_new
-
-  try:
-    yield
-  finally:
-    torch.Tensor.__new__ = original_new
-
-
-@contextmanager
-def override_torch_constructors(torch_function_overrides=None):
-  torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
-  original_arange, original_zeros = torch.arange, torch.zeros
-  torch.arange = torch_function_overrides.get(original_arange, HANDLED_FUNCTIONS[original_arange])
-  torch.zeros = torch_function_overrides.get(original_zeros, HANDLED_FUNCTIONS[original_zeros])
-  try:
-    yield
-  finally:
-    torch.arange, torch.zeros = original_arange, original_zeros
-
-
 def t2j_function(f, *, torch_function_overrides=None):
   torch_function_overrides = _freeze_torch_function_overrides(torch_function_overrides)
 
@@ -2170,11 +2150,13 @@ def t2j_function(f, *, torch_function_overrides=None):
     wrap = lambda value: value if isinstance(value, (str, bytes)) else Torchish(value)
     torch_args = jax.tree.map(wrap, args)
     torch_kwargs = jax.tree.map(wrap, kwargs)
-    with override_Tensor_constructor():
-      with override_torch_constructors(torch_function_overrides):
-        with RngPooperContext(None if rng is None else RngPooper(rng)):
-          with TorchishMode(torch_function_overrides):
-            out = f(*torch_args, **torch_kwargs)
+    token = _CONSTRUCTOR_OVERRIDES.set(torch_function_overrides)
+    try:
+      with RngPooperContext(None if rng is None else RngPooper(rng)):
+        with TorchishMode(torch_function_overrides):
+          out = f(*torch_args, **torch_kwargs)
+    finally:
+      _CONSTRUCTOR_OVERRIDES.reset(token)
     # use the torch's tree_map, because out is generated from torch code
     return _tree_coerce(out)
 
@@ -2321,3 +2303,34 @@ def j2t(thing):
     return j2t_dtype(thing)
   else:
     raise NotImplementedError
+
+
+def _install_constructor_dispatch():
+  """Route symbolic constructors by context without replacing functions during tracing."""
+
+  def wrap(original):
+    @functools.wraps(original)
+    def dispatch(*args, **kwargs):
+      overrides = _CONSTRUCTOR_OVERRIDES.get()
+      if overrides is None:
+        return original(*args, **kwargs)
+      return overrides.get(original, HANDLED_FUNCTIONS[original])(*args, **kwargs)
+
+    _CONSTRUCTOR_ORIGINALS[dispatch] = original
+    return dispatch
+
+  # PyTorch validates symbolic dimensions before TorchFunctionMode can intercept them.
+  torch.arange = wrap(torch.arange)
+  torch.zeros = wrap(torch.zeros)
+  original_new = torch.Tensor.__new__
+
+  @functools.wraps(original_new)
+  def tensor_new(cls, *args, **kwargs):
+    if _CONSTRUCTOR_OVERRIDES.get() is not None:
+      raise ValueError("torch.Tensor(...) is not supported during conversion; use torch.tensor(...) instead.")
+    return original_new(cls, *args, **kwargs)
+
+  torch.Tensor.__new__ = tensor_new
+
+
+_install_constructor_dispatch()

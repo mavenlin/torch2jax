@@ -13,37 +13,37 @@ jrk = jr.PRNGKey
 
 
 def test_mk_rng():
-  s = torch2jax._RNG_POOPER_STACK
+  s = torch2jax._RNG_POOPER_STACK.get
   rngeq = lambda x, y: (x == y).all()
   jrs = jr.split
 
   with pytest.raises(Exception):
     torch2jax.mk_rng()
 
-  assert len(s) == 0
+  assert len(s()) == 0
   with torch2jax.RngPooperContext(torch2jax.RngPooper(jrk(0))):
-    assert len(s) == 1 and rngeq(s[-1].rng, jrk(0))
+    assert len(s()) == 1 and rngeq(s()[-1].rng, jrk(0))
     assert rngeq(torch2jax.mk_rng(), jrs(jrk(0))[1])
-    assert len(s) == 1 and rngeq(s[-1].rng, jrs(jrk(0))[0])
+    assert len(s()) == 1 and rngeq(s()[-1].rng, jrs(jrk(0))[0])
 
     with torch2jax.RngPooperContext(torch2jax.RngPooper(jrk(123))):
-      assert len(s) == 2 and rngeq(s[-1].rng, jrk(123))
+      assert len(s()) == 2 and rngeq(s()[-1].rng, jrk(123))
       assert rngeq(torch2jax.mk_rng(), jrs(jrk(123))[1])
-      assert len(s) == 2 and rngeq(s[-1].rng, jrs(jrk(123))[0])
+      assert len(s()) == 2 and rngeq(s()[-1].rng, jrs(jrk(123))[0])
 
       with torch2jax.RngPooperContext(None):
-        assert len(s) == 3 and s[-1] is None
+        assert len(s()) == 3 and s()[-1] is None
         with pytest.raises(Exception):
           torch2jax.mk_rng()
 
-      assert len(s) == 2 and rngeq(s[-1].rng, jrs(jrk(123))[0])
+      assert len(s()) == 2 and rngeq(s()[-1].rng, jrs(jrk(123))[0])
 
-    assert len(s) == 1 and rngeq(s[-1].rng, jrs(jrk(0))[0])
+    assert len(s()) == 1 and rngeq(s()[-1].rng, jrs(jrk(0))[0])
 
     # Consecutive calls to mk_rng should return different keys.
     assert not rngeq(torch2jax.mk_rng(), torch2jax.mk_rng())
 
-  assert len(s) == 0
+  assert len(s()) == 0
 
 
 def test_bernoulli():
