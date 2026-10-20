@@ -547,7 +547,8 @@ def clamp(input, min=None, max=None):
 
 
 auto_implements(torch.cos, jnp.cos, out_kwarg=True, Torchish_member=True)
-auto_implements(torch.clone, lambda x: x, Torchish_member=True)  # jax arrays are immutable, no copy needed
+# jax arrays are immutable and have no memory format, so no copy is needed
+auto_implements(torch.clone, lambda x, memory_format=None: x, Torchish_member=True)
 auto_implements(torch.div, jnp.divide, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.exp, jnp.exp, out_kwarg=True, Torchish_member=True)
 
@@ -935,7 +936,7 @@ def ones_like(
 def where(condition, input=None, other=None):
   if input is None and other is None:
     return jnp.where(_v(condition))
-  return jnp.where(_v(condition), _v(input), _v(other))
+  return jnp.where(_v(condition), _coerce(input), _coerce(other))
 
 
 @implements(torch.poisson)

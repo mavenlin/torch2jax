@@ -636,6 +636,15 @@ def test_oneliners():
     samplers=[random.bernoulli, random.normal, random.normal],
     tests=[forward_test, partial(backward_test, argnums=(1, 2))],
   )
+  t2j_function_test(
+    lambda c, x: torch.where(c, x, 0.0),
+    [(3, 5), (3, 5)],
+    samplers=[random.bernoulli, random.normal],
+    tests=[forward_test, partial(backward_test, argnums=(1,))],
+  )
+  t2j_function_test(
+    lambda c: torch.where(c, 0.0, -float("inf")), [(3, 5)], samplers=[random.bernoulli], tests=[forward_test]
+  )
   t2j_function_test(torch.norm, [(3, 5)], kwargs=dict(dim=1), tests=fbmo)
   t2j_function_test(lambda x: torch.full_like(x, 2.0), [(3, 5)], tests=f)
   t2j_function_test(lambda x: 0 * torch.nan_to_num(torch.empty_like(x)), [(3, 5)], tests=f)
@@ -716,6 +725,8 @@ def test_Tensor_clone():
   t2j_function_test(torch.clone, [()], tests=fbm)
   t2j_function_test(torch.clone, [(2,)], tests=fbm)
   t2j_function_test(lambda x: x.clone().add_(1), [(2,)], tests=fb)
+  t2j_function_test(lambda x: x.clone(memory_format=torch.contiguous_format), [(2, 3)], tests=fb)
+  t2j_function_test(lambda x: torch.clone(x, memory_format=torch.preserve_format), [(2, 3)], tests=fb)
 
   def f(x):
     x.clone().add_(1)
