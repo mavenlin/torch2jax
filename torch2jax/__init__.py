@@ -579,6 +579,68 @@ auto_implements(torch.rsqrt, jax.lax.rsqrt, out_kwarg=True, Torchish_member=True
 auto_implements(torch.sigmoid, jax.nn.sigmoid, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.sin, jnp.sin, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.sqrt, jnp.sqrt, out_kwarg=True, Torchish_member=True)
+
+
+@implements(torch.stft, Torchish_member=True)
+def stft(
+  input,
+  n_fft,
+  hop_length=None,
+  win_length=None,
+  window=None,
+  center=True,
+  pad_mode="reflect",
+  normalized=False,
+  onesided=None,
+  return_complex=None,
+  align_to_window=None,
+):
+  """STFT with PyTorch's framing, window promotion, and FFT normalization."""
+  x = _v(input)
+  if x.ndim not in (1, 2) or not jnp.issubdtype(x.dtype, jnp.inexact):
+    raise RuntimeError("stft requires floating point or complex 1D or 2D input")
+  if center and align_to_window is not None:
+    raise RuntimeError("align_to_window may only be specified when center=False")
+  hop_length = n_fft // 4 if hop_length is None else hop_length
+  win_length = n_fft if win_length is None else win_length
+  if hop_length <= 0 or not 0 < win_length <= n_fft:
+    raise RuntimeError("stft requires a positive hop and 0 < win_length <= n_fft")
+  window = jnp.ones(win_length, x.dtype) if window is None else _v(window)
+  if window.shape != (win_length,):
+    raise RuntimeError("stft requires a 1D window of length win_length")
+  complex_input = jnp.iscomplexobj(x) or jnp.iscomplexobj(window)
+  if return_complex is None and not complex_input:
+    raise RuntimeError("return_complex must be specified for real input and window")
+  return_complex = complex_input if return_complex is None else return_complex
+  onesided = not complex_input if onesided is None else onesided
+  if onesided and complex_input:
+    raise RuntimeError("onesided output requires real input and window")
+  if center:
+    mode = {"reflect": "reflect", "constant": "constant", "replicate": "edge", "circular": "wrap"}.get(pad_mode)
+    if mode is None:
+      raise NotImplementedError(f"unsupported padding mode: {pad_mode}")
+    padding = n_fft // 2
+    if (pad_mode == "reflect" and padding >= x.shape[-1]) or (pad_mode == "circular" and padding > x.shape[-1]):
+      raise RuntimeError("padding exceeds the input supported by this mode")
+    x = jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(padding, padding)], mode=mode)
+  if x.shape[-1] < n_fft:
+    raise RuntimeError("input is shorter than one FFT frame")
+  left = (n_fft - win_length) // 2
+  window = jnp.pad(window, (left, n_fft - win_length - left))
+  count = 1 + (x.shape[-1] - (win_length if align_to_window else n_fft)) // hop_length
+  if align_to_window:
+    x = jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(left, left)])
+    if (count - 1) * hop_length + n_fft > x.shape[-1]:
+      raise RuntimeError("aligned FFT frame extends past the padded input")
+  starts = jnp.arange(count) * hop_length
+  frames = x[..., starts[:, None] + jnp.arange(n_fft)] * window
+  if frames.dtype not in (jnp.float32, jnp.float64, jnp.complex64, jnp.complex128):
+    raise NotImplementedError(f"unsupported FFT computation dtype: {frames.dtype}")
+  fft = jnp.fft.rfft if onesided else jnp.fft.fft
+  result = jnp.swapaxes(fft(frames, norm="ortho" if normalized else "backward"), -1, -2)
+  return result if return_complex else jnp.stack((result.real, result.imag), axis=-1)
+
+
 auto_implements(torch.sub, jnp.subtract, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.tanh, jnp.tanh, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.transpose, jnp.swapaxes, Torchish_member=True)
