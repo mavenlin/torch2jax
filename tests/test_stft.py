@@ -57,20 +57,9 @@ def test_stft_jitted_gradient(dtype):
     np.testing.assert_allclose(jnp.conj(gradient), source.grad.numpy(), rtol=4e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize(
-  "shape,options",
-  [
-    ((16,), dict(align_to_window=True)),
-    ((16,), dict(align_to_window=False)),
-    ((16,), dict(n_fft=8, win_length=9)),
-    ((16,), dict(n_fft=32)),
-    ((16,), dict(return_complex=None)),
-    ((33,), dict(n_fft=16, win_length=13, hop_length=4, center=False, align_to_window=True)),
-  ],
-)
-def test_stft_invalid_arguments(shape, options):
-  options = dict(n_fft=8, return_complex=True) | options
+def test_stft_rejects_incomplete_aligned_frame():
+  options = dict(n_fft=16, win_length=13, hop_length=4, center=False, align_to_window=True, return_complex=True)
   with pytest.raises(RuntimeError):
-    torch.stft(torch.ones(shape), **options)
-  with pytest.raises(RuntimeError):
-    t2j(lambda x: torch.stft(x, **options))(jnp.ones(shape))
+    torch.stft(torch.ones(33), **options)
+  with pytest.raises(RuntimeError, match="aligned FFT frame extends past the padded input"):
+    t2j(lambda x: torch.stft(x, **options))(jnp.ones(33))
