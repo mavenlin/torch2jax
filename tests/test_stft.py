@@ -42,7 +42,9 @@ def test_stft_forward_and_gradient(shape, options, dtype, window_dtype, member):
     tolerance = 1e-11 if jnp.result_type(*args) in (jnp.float64, jnp.complex128) else 1e-5
     forward_test(call, args, rtol=3 * tolerance, atol=tolerance)
     if all(jnp.issubdtype(x.dtype, jnp.floating) for x in args):
-      backward_test(lambda *args: torch.abs(call(*args)) ** 2, args, rtol=4e-5, atol=1e-6)
+      # GPU overlap accumulation may differ by an FP16 rounding step.
+      gradient_rtol = max(4e-5, 2 * max(float(jnp.finfo(x.dtype).eps) for x in args))
+      backward_test(lambda *args: torch.abs(call(*args)) ** 2, args, rtol=gradient_rtol, atol=1e-6)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.complex64, jnp.complex128])
@@ -63,3 +65,37 @@ def test_stft_rejects_incomplete_aligned_frame():
     torch.stft(torch.ones(33), **options)
   with pytest.raises(RuntimeError, match="aligned FFT frame extends past the padded input"):
     t2j(lambda x: torch.stft(x, **options))(jnp.ones(33))
+
+
+@pytest.mark.parametrize("return_complex", [True, False])
+def test_stft_layout_vmap_and_composition(return_complex):
+  values = jax.random.normal(jax.random.key(3), (3, 64))
+
+  def call(x):
+    return torch.stft(x, 16, hop_length=4, return_complex=return_complex)
+
+  converted = t2j(call)
+  expected = call(torch.tensor(np.asarray(values))).numpy()
+  mapped = jax.jit(jax.vmap(converted))(values)
+  np.testing.assert_allclose(mapped, expected, rtol=2e-5, atol=2e-5)
+  # Consumers must see the usual logical frequency/time axes despite the layout.
+  reduced = jax.jit(lambda x: jnp.abs(converted(x)).sum(axis=-1))(values)
+  np.testing.assert_allclose(reduced, np.abs(expected).sum(axis=-1), rtol=2e-5, atol=2e-5)
+
+
+def test_stft_bfloat16_input_float32_window():
+  values = jax.random.normal(jax.random.key(4), (2, 97)).astype(jnp.bfloat16)
+  window = jnp.hanning(17)[:-1]
+  source = torch.tensor(np.asarray(values.astype(jnp.float32)), dtype=torch.bfloat16, requires_grad=True)
+  torch_window = torch.tensor(np.asarray(window))
+
+  def call(x, w):
+    return torch.stft(x, 16, hop_length=4, window=w, return_complex=True)
+
+  expected = call(source, torch_window)
+  actual = jax.jit(t2j(call))(values, window)
+  np.testing.assert_allclose(actual, expected.detach().numpy(), rtol=2e-5, atol=2e-5)
+  expected.abs().square().mean().backward()
+  gradient = jax.jit(jax.grad(lambda x: jnp.mean(jnp.abs(t2j(call)(x, window)) ** 2)))(values)
+  # BF16 overlap accumulation can round differently across frameworks.
+  np.testing.assert_allclose(gradient.astype(jnp.float32), source.grad.float().numpy(), rtol=0.02, atol=0.002)
