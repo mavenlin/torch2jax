@@ -1772,35 +1772,84 @@ def group_norm(input, num_groups, weight=None, bias=None, eps=1e-05):
 
 @implements(torch.nn.functional.interpolate)
 def interpolate(
-  input,
-  size=None,
-  scale_factor=None,
-  mode="nearest",
-  align_corners=None,
-  recompute_scale_factor=None,
-  antialias=False,
+  input, size=None, scale_factor=None, mode="nearest", align_corners=None, recompute_scale_factor=None, antialias=False
 ):
-  assert mode == "nearest", "TODO: implement modes other than nearest"
-  assert align_corners is None
-  assert not antialias
-  assert 3 <= input.ndim <= 5
-  assert (size is None) != (scale_factor is None)
+  x = _v(input)
+  spatial = x.shape[2:]
+  factors = tuple(scale_factor) if isinstance(scale_factor, (tuple, list)) else (scale_factor,) * len(spatial)
+  if size is None:
+    size = tuple(math.floor(s * f) for s, f in zip(spatial, factors))
+  elif isinstance(size, Integral):
+    size = (size,) * len(spatial)
+  shape = x.shape[:2] + tuple(size)
+  resize_scales = tuple(t / s for s, t in zip(spatial, size))
+  scales = resize_scales
+  if scale_factor is not None and not recompute_scale_factor:
+    scales = factors
 
-  spatial_shape = input.shape[2:]
-  if size is not None:
-    output_shape = (size,) * len(spatial_shape) if isinstance(size, int) else tuple(size)
-    scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
-  else:
-    scales = (scale_factor,) * len(spatial_shape) if isinstance(scale_factor, (int, float)) else tuple(scale_factor)
-    output_shape = tuple(math.floor(input * scale) for input, scale in zip(spatial_shape, scales))
-    if recompute_scale_factor:
-      scales = tuple(output / input for input, output in zip(spatial_shape, output_shape))
+  # PyTorch's legacy nearest uses floor, whereas JAX nearest uses pixel centers.
+  # Explicit scale factors also need to survive output-size rounding.
+  if mode == "nearest" or (mode == "nearest-exact" and scales != resize_scales):
+    offset = 0.5 if mode == "nearest-exact" else 0.0
+    for axis, (target, scale) in enumerate(zip(size, scales), start=2):
+      indices = jnp.floor((jnp.arange(target) + offset) * (1 / scale)).astype(jnp.int32)
+      x = jnp.take(x, jnp.minimum(indices, x.shape[axis] - 1), axis=axis)
+    return x
 
-  result = _v(input)
-  for axis, (input_size, output_size, scale) in enumerate(zip(spatial_shape, output_shape, scales), start=2):
-    indices = jnp.floor(jnp.arange(output_size) / scale).astype(jnp.int32)
-    result = jnp.take(result, jnp.minimum(indices, input_size - 1), axis=axis)
-  return result
+  # PyTorch area uses adaptive-pooling bins, not JAX's fractional pixel overlaps.
+  if mode == "area":
+    for axis, (source, target) in enumerate(zip(spatial, size), start=2):
+      x = jnp.stack(
+        [
+          jax.lax.slice_in_dim(x, i * source // target, ((i + 1) * source + target - 1) // target, axis=axis).mean(axis)
+          for i in range(target)
+        ],
+        axis=axis,
+      )
+    return x
+
+  method = {"nearest-exact": "nearest", "bilinear": "linear", "trilinear": "linear"}.get(mode, mode)
+  # JAX's ordinary cubic kernel differs from PyTorch without antialiasing.
+  if mode == "bicubic":
+    method = "cubic" if antialias else "cubic-pytorch"
+  if not align_corners and scales == resize_scales:
+    return jax.image.resize(x, shape, method=method, antialias=antialias)
+  if mode == "nearest-exact":
+    return jax.image.resize(x, shape, method=method, antialias=antialias)
+
+  if align_corners:
+    # Antialiased singleton axes use zero inverse scale in PyTorch. Infinity
+    # represents that in JAX's output/input scale convention.
+    scales = tuple(
+      (t - 1) / (s - 1) if s > 1 and t > 1 else math.inf if antialias else t for s, t in zip(spatial, size)
+    )
+  scale = jnp.asarray(scales)
+  # Antialiased PyTorch kernels use pixel centers even with align_corners=True.
+  translation = (
+    jnp.where(jnp.asarray(spatial) > 1, (1 - scale) / 2, 0)
+    if align_corners and not antialias
+    else jnp.zeros_like(scale)
+  )
+
+  def resample(value):
+    return jax.image.scale_and_translate(
+      value,
+      shape,
+      spatial_dims=tuple(range(2, x.ndim)),
+      scale=scale,
+      translation=translation,
+      method=method,
+      antialias=antialias,
+    )
+
+  if align_corners and antialias:
+    # Strong downsampling can put the final center outside the input. Extend
+    # JAX's sampling domain, then normalize away the added zero-padding weights.
+    padding = ((0, 0), (0, 0)) + tuple(
+      (0, builtins.max(0, math.ceil((t - 0.5) / f - s))) for s, t, f in zip(spatial, size, scales)
+    )
+    return resample(jnp.pad(x, padding)) / resample(jnp.pad(jnp.ones_like(x), padding))
+  return resample(x)
 
 
 @implements(torch.nn.functional.linear)
