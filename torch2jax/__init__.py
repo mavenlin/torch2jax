@@ -19,7 +19,6 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from flax import nnx
-from jax.experimental.layout import Layout, with_layout_constraint
 from torch.overrides import TorchFunctionMode, resolve_name
 from torch.utils._pytree import register_pytree_node as torch_register_pytree_node
 from torch.utils._pytree import tree_map as torch_tree_map
@@ -620,9 +619,6 @@ def stft(
   frames = x[..., starts[:, None] + jnp.arange(n_fft)] * window
   fft = jnp.fft.rfft if onesided else jnp.fft.fft
   result = jnp.swapaxes(fft(frames, norm="ortho" if normalized else "backward"), -1, -2)
-  # Keep the FFT buffer layout: swapping frequency/time axes needs no device copy.
-  order = (*range(result.ndim - 2), result.ndim - 1, result.ndim - 2)
-  result = with_layout_constraint(result, Layout(order))
   return result if return_complex else jnp.stack((result.real, result.imag), axis=-1)
 
 

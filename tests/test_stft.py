@@ -68,7 +68,7 @@ def test_stft_rejects_incomplete_aligned_frame():
 
 
 @pytest.mark.parametrize("return_complex", [True, False])
-def test_stft_layout_vmap_and_composition(return_complex):
+def test_stft_vmap_and_composition(return_complex):
   values = jax.random.normal(jax.random.key(3), (3, 64))
 
   def call(x):
@@ -78,7 +78,7 @@ def test_stft_layout_vmap_and_composition(return_complex):
   expected = call(torch.tensor(np.asarray(values))).numpy()
   mapped = jax.jit(jax.vmap(converted))(values)
   np.testing.assert_allclose(mapped, expected, rtol=2e-5, atol=2e-5)
-  # Consumers must see the usual logical frequency/time axes despite the layout.
+  # Consumers must see the usual logical frequency/time axes.
   reduced = jax.jit(lambda x: jnp.abs(converted(x)).sum(axis=-1))(values)
   np.testing.assert_allclose(reduced, np.abs(expected).sum(axis=-1), rtol=2e-5, atol=2e-5)
 
