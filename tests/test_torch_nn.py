@@ -632,13 +632,89 @@ def test_torch_nn_functional_interpolate_nearest():
       )
 
 
-def test_torch_nn_functional_interpolate_rejects_unsupported():
-  x = jnp.zeros((2, 3, 4, 4))
-  with pytest.raises(NotImplementedError):
-    t2j(partial(torch.nn.functional.interpolate, scale_factor=2.0, mode="bilinear"))(x)
-  with pytest.raises(NotImplementedError):
-    t2j(partial(torch.nn.functional.interpolate, scale_factor=1.5, mode="nearest"))(x)
-  with pytest.raises(NotImplementedError):
-    t2j(partial(torch.nn.functional.interpolate, size=(6, 6), mode="nearest"))(x)
+@pytest.mark.parametrize(
+  "mode,shape",
+  [
+    ("nearest", (2, 3, 5)),
+    ("nearest-exact", (2, 3, 5)),
+    ("linear", (2, 3, 5)),
+    ("bilinear", (2, 3, 5, 7)),
+    ("trilinear", (2, 3, 3, 5, 7)),
+    ("bicubic", (2, 3, 5, 7)),
+    ("area", (2, 3, 5, 7)),
+  ],
+)
+@pytest.mark.parametrize(
+  "kwargs",
+  [
+    {"size": 3},
+    {"size": 8},
+    {"scale_factor": 1.7},
+    {"scale_factor": 0.7},
+    {"scale_factor": 1.7, "recompute_scale_factor": True},
+  ],
+)
+def test_torch_nn_functional_interpolate_resize(mode, shape, kwargs):
+  t2j_function_test(
+    partial(torch.nn.functional.interpolate, mode=mode, **kwargs),
+    [shape],
+    num_tests=1,
+    atol=5e-6 if mode == "bicubic" else 2e-6,
+  )
+
+
+@pytest.mark.parametrize("shape", [(2, 3, 5), (2, 3, 1), (2, 3, 5, 7)])
+@pytest.mark.parametrize("size", [1, 3, 8])
+def test_torch_nn_functional_interpolate_align_corners(shape, size):
+  mode = "linear" if len(shape) == 3 else "bilinear"
+  t2j_function_test(
+    partial(torch.nn.functional.interpolate, mode=mode, size=size, align_corners=True),
+    [shape],
+    num_tests=1,
+    atol=5e-6 if mode == "bicubic" else 2e-6,
+  )
+
+
+@pytest.mark.parametrize("mode", ["bilinear", "bicubic"])
+@pytest.mark.parametrize("size", [(3, 4), (8, 11)])
+def test_torch_nn_functional_interpolate_antialias(mode, size):
+  t2j_function_test(
+    partial(torch.nn.functional.interpolate, mode=mode, size=size, antialias=True),
+    [(2, 3, 5, 7)],
+    num_tests=1,
+    atol=5e-6 if mode == "bicubic" else 2e-6,
+  )
+
+
+@pytest.mark.parametrize("mode", ["nearest", "nearest-exact", "bilinear", "bicubic"])
+@pytest.mark.parametrize("kwargs", [{"size": (3, 9)}, {"scale_factor": (0.7, 1.7)}])
+def test_torch_nn_functional_interpolate_per_axis(mode, kwargs):
+  t2j_function_test(
+    partial(torch.nn.functional.interpolate, mode=mode, **kwargs),
+    [(2, 3, 5, 7)],
+    num_tests=1,
+    atol=5e-6 if mode == "bicubic" else 2e-6,
+  )
+
+
+@pytest.mark.parametrize("mode", ["bilinear", "bicubic"])
+@pytest.mark.parametrize(
+  "kwargs",
+  [
+    {"size": (3, 4), "align_corners": True},
+    {"size": (3, 4), "align_corners": True, "antialias": True},
+    {"size": (2, 2), "align_corners": True, "antialias": True},
+    {"scale_factor": (0.7, 1.7), "antialias": True},
+  ],
+)
+def test_torch_nn_functional_interpolate_weighted_gradient(mode, kwargs):
+  def f(x):
+    y = torch.nn.functional.interpolate(x, mode=mode, **kwargs)
+    return y * y
+
+  t2j_function_test(f, [(2, 3, 5, 7)], num_tests=1, atol=3e-6)
+
+
+def test_torch_nn_functional_interpolate_unknown_mode():
   with pytest.raises(ValueError):
-    t2j(partial(torch.nn.functional.interpolate, mode="nearest"))(x)
+    t2j(partial(torch.nn.functional.interpolate, size=(3, 4), mode="unknown"))(jnp.zeros((2, 3, 5, 7)))
