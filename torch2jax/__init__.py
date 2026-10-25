@@ -580,6 +580,49 @@ auto_implements(torch.rsqrt, jax.lax.rsqrt, out_kwarg=True, Torchish_member=True
 auto_implements(torch.sigmoid, jax.nn.sigmoid, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.sin, jnp.sin, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.sqrt, jnp.sqrt, out_kwarg=True, Torchish_member=True)
+
+
+@implements(torch.stft, Torchish_member=True)
+def stft(
+  input,
+  n_fft,
+  hop_length=None,
+  win_length=None,
+  window=None,
+  center=True,
+  pad_mode="reflect",
+  normalized=False,
+  onesided=None,
+  return_complex=None,
+  align_to_window=None,
+):
+  """STFT for valid PyTorch inputs, with matching framing, promotion, and normalization."""
+  x = _v(input)
+  hop_length = n_fft // 4 if hop_length is None else hop_length
+  win_length = n_fft if win_length is None else win_length
+  window = jnp.ones(win_length, x.dtype) if window is None else _v(window)
+  complex_input = jnp.iscomplexobj(x) or jnp.iscomplexobj(window)
+  return_complex = complex_input if return_complex is None else return_complex
+  onesided = not complex_input if onesided is None else onesided
+  if center:
+    mode = {"reflect": "reflect", "constant": "constant", "replicate": "edge", "circular": "wrap"}[pad_mode]
+    padding = n_fft // 2
+    x = jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(padding, padding)], mode=mode)
+  left = (n_fft - win_length) // 2
+  window = jnp.pad(window, (left, n_fft - win_length - left))
+  count = 1 + (x.shape[-1] - (win_length if align_to_window else n_fft)) // hop_length
+  if align_to_window:
+    x = jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(left, left)])
+    # JAX gathers clamp out-of-bounds indices instead of rejecting an incomplete frame.
+    if (count - 1) * hop_length + n_fft > x.shape[-1]:
+      raise RuntimeError("aligned FFT frame extends past the padded input")
+  starts = jnp.arange(count) * hop_length
+  frames = x[..., starts[:, None] + jnp.arange(n_fft)] * window
+  fft = jnp.fft.rfft if onesided else jnp.fft.fft
+  result = jnp.swapaxes(fft(frames, norm="ortho" if normalized else "backward"), -1, -2)
+  return result if return_complex else jnp.stack((result.real, result.imag), axis=-1)
+
+
 auto_implements(torch.sub, jnp.subtract, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.tanh, jnp.tanh, out_kwarg=True, Torchish_member=True)
 auto_implements(torch.transpose, jnp.swapaxes, Torchish_member=True)

@@ -9,7 +9,11 @@ from torch.utils._pytree import tree_map as torch_tree_map
 
 from torch2jax import j2t, t2j
 
-aac = chex.assert_trees_all_close
+
+def aac(*args, **kwargs):
+  # Chex cannot implicitly convert CUDA tensors to NumPy arrays.
+  args = jax.tree.map(lambda x: x.detach().cpu() if isinstance(x, torch.Tensor) else x, args)
+  chex.assert_trees_all_close(*args, **kwargs)
 
 
 def anac(*args, **kwargs):
