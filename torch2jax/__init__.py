@@ -888,6 +888,41 @@ def mean(input, dim=None, keepdim=False, dtype=None):
   return jnp.mean(_v(input), axis=dim, keepdims=keepdim, dtype=dtype)
 
 
+@implements(torch.std, out_kwarg=True, Torchish_member=True)
+def std(input, dim=None, unbiased=None, keepdim=False, *, correction=None):
+  if isinstance(dim, bool):
+    if unbiased is not None:
+      raise TypeError("std received both positional and keyword unbiased arguments")
+    unbiased, dim = dim, None
+  if unbiased is not None and correction is not None:
+    raise TypeError("std cannot specify both unbiased and correction")
+  correction = int(unbiased) if unbiased is not None else 1 if correction is None else correction
+  x = _v(input)
+  if not jnp.issubdtype(x.dtype, jnp.inexact):
+    raise RuntimeError("std only supports floating point and complex dtypes")
+  axes = (
+    tuple(range(x.ndim))
+    if dim is None or dim == () or dim == []
+    else (dim,)
+    if isinstance(dim, Integral)
+    else tuple(dim)
+  )
+  if x.ndim == 0 and axes in ((0,), (-1,)):
+    axes = ()
+  output_dtype = x.real.dtype
+  if x.dtype in (jnp.float16, jnp.bfloat16):
+    x = x.astype(jnp.float32)
+  centered = x - jnp.mean(x, axis=axes, keepdims=True)
+  squared = jnp.real(centered * jnp.conj(centered))
+  count = math.prod(x.shape[axis] for axis in axes)
+  # Torch clamps the divisor to zero: nonconstant reductions can return inf.
+  variance = jnp.sum(squared, axis=axes, keepdims=keepdim) / jnp.maximum(count - correction, 0)
+  # Torch defines the derivative at zero standard deviation to be zero.
+  zero = variance == 0
+  result = jnp.where(zero, 0, jnp.sqrt(jnp.where(zero, 1, variance)))
+  return result.astype(output_dtype)
+
+
 @implements(torch.norm, out_kwarg=True, Torchish_member=True)
 def norm(input, p="fro", dim=None, keepdim=False, out=None, dtype=None):
   assert out is None, "TODO: implement out argument"
