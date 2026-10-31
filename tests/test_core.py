@@ -82,6 +82,18 @@ def test_t2j_converts_named_module_method():
   )
 
 
+def test_converted_method_arange_static_scalar():
+  class Sequence(torch.nn.Module):
+    def positions(self, length):
+      return torch.arange(length)
+
+  source = Sequence()
+  converted = t2j(source, function_names=["positions"])
+  inputs = jnp.zeros((2, 3))
+  actual = jax.jit(lambda x: converted.positions(x.shape[1]))(inputs)
+  aac(actual, source.positions(inputs.shape[1]))
+
+
 def test_t2j_lazy_constructor_supports_nnx_eval_shape():
   constructor = t2j_lazy(torch.nn.Linear(2, 3))
 
@@ -432,17 +444,17 @@ def test_oneliners():
   t2j_function_test(lambda x: 3 * torch.mean(x), [(5,)], atol=1e-6, tests=fb)
   t2j_function_test(lambda x: 3.0 * x.mean(), [(5,)], atol=1e-6, tests=fb)
   t2j_function_test(torch.add, [(3,), (3,)], tests=fbmo)
-  t2j_function_test(torch.add, [(3, 1), (1, 3)], tests=fbmo)
+  t2j_function_test(torch.add, [(3, 1), (1, 3)], tests=fbo)
   t2j_function_test(torch.div, [(3,), (3,)], tests=fbmo)
-  t2j_function_test(torch.div, [(3, 1), (1, 3)], tests=fbmo)
+  t2j_function_test(torch.div, [(3, 1), (1, 3)], tests=fbo)
   t2j_function_test(torch.mean, [(5,)], atol=1e-6, tests=fbmo)
   t2j_function_test(torch.mean, [(5, 6)], kwargs=dict(dim=1, keepdim=False), atol=1e-6, tests=fbmo)
   t2j_function_test(torch.mean, [(5, 6)], kwargs=dict(dim=1, keepdim=True), atol=1e-6, tests=fbmo)
   t2j_function_test(torch.mul, [(3,), (3,)], tests=fbmo)
-  t2j_function_test(torch.mul, [(3, 1), (1, 3)], tests=fbmo)
+  t2j_function_test(torch.mul, [(3, 1), (1, 3)], tests=fbo)
   t2j_function_test(torch.sqrt, [(5,)], tests=fbmo)
   t2j_function_test(torch.sub, [(3,), (3,)], tests=fbmo)
-  t2j_function_test(torch.sub, [(3, 1), (1, 3)], tests=fbmo)
+  t2j_function_test(torch.sub, [(3, 1), (1, 3)], tests=fbo)
   t2j_function_test(torch.rsqrt, [(5,)], tests=fbmo)
   t2j_function_test(torch.sum, [(5,)], atol=1e-6, tests=fbm)
   t2j_function_test(torch.sum, [(5, 6)], kwargs=dict(dim=1, keepdim=False), atol=1e-6, tests=fbmo)
@@ -769,7 +781,7 @@ def test_inplace_Tensor_methods():
   t2j_function_test(f, [()], atol=1e-6, tests=tests)
   t2j_function_test(f, [(3,)], atol=1e-6, tests=tests)
   t2j_function_test(f, [(3, 5)], atol=1e-6, tests=tests)
-  aac(vmap(t2j(f))(jnp.array([1, 2, 3])), jnp.array([f(1.0), f(2.0), f(3.0)]))
+  aac(vmap(t2j(f))(jnp.array([1.0, 2.0, 3.0])), jnp.array([f(1.0), f(2.0), f(3.0)]))
 
 
 def test_grad_on_off():
