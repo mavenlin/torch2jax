@@ -5,6 +5,8 @@ import torch
 
 from torch2jax import j2t, t2j
 
+from .utils import backward_test
+
 
 def test_t2j_dtype():
   assert t2j(torch.float16) == jnp.float16
@@ -100,3 +102,61 @@ def test_promote_types_in_converted_function(left, right):
   actual = jax.jit(t2j(add))(t2j(x), t2j(y))
   assert actual.dtype == t2j(expected.dtype)
   assert jnp.array_equal(actual, t2j(expected))
+
+
+@pytest.mark.parametrize(
+  "operation,left,right",
+  [
+    ("add_", torch.bfloat16, torch.float32),
+    ("sub_", torch.bfloat16, torch.float32),
+    ("mul_", torch.float16, torch.float32),
+    ("div_", torch.bfloat16, torch.float32),
+    ("add_", torch.uint8, torch.int32),
+  ],
+)
+def test_inplace_arithmetic_preserves_dtype(operation, left, right):
+  def call(x, y):
+    x = x.clone()
+    assert getattr(x, operation)(y) is x
+    return x
+
+  x = torch.tensor([[1.5, 3.5, 250], [2.0, 1.5, 3.5]], dtype=left)
+  y = torch.tensor([1.003, 1 / 3, 10.03], dtype=right)
+  expected = call(x, y)
+  actual = jax.jit(t2j(call))(t2j(x), t2j(y))
+  assert actual.dtype == t2j(left)
+  assert actual.shape == expected.shape
+  assert jnp.array_equal(actual, t2j(expected))
+
+
+@pytest.mark.parametrize(
+  "operation,left,right",
+  [
+    ("add_", torch.int32, torch.float32),
+    ("mul_", torch.bool, torch.int32),
+    ("mul_", torch.float32, torch.complex64),
+    ("div_", torch.int32, torch.int32),
+  ],
+)
+def test_inplace_arithmetic_rejects_invalid_cast(operation, left, right):
+  call = lambda x, y: getattr(x, operation)(y)
+  x, y = torch.ones(2, dtype=left), torch.ones(2, dtype=right)
+  with pytest.raises(RuntimeError, match="cast"):
+    call(x.clone(), y)
+  with pytest.raises(RuntimeError, match="cast"):
+    jax.jit(t2j(call))(t2j(x), t2j(y))
+
+
+def test_inplace_arithmetic_rejects_expanding_destination():
+  call = lambda x, y: x.add_(y)
+  x, y = torch.ones(1, 3), torch.ones(2, 3)
+  with pytest.raises(RuntimeError, match="broadcast"):
+    call(x.clone(), y)
+  with pytest.raises(RuntimeError, match="broadcast"):
+    jax.jit(t2j(call))(t2j(x), t2j(y))
+
+
+def test_inplace_mixed_dtype_gradient():
+  call = lambda x, y: x.to(torch.bfloat16).mul_(y).add_(y).float()
+  args = [jnp.array([1.5, 3.5]), jnp.array([1.003, 1 / 3])]
+  backward_test(call, args, rtol=0, atol=0, strict=True)
