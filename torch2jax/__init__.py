@@ -234,18 +234,20 @@ class Torchish:
   def __ne__(self, other): return Torchish(self.value != _coerce(other))
   def __gt__(self, other): return Torchish(self.value > _coerce(other))
   def __ge__(self, other): return Torchish(self.value >= _coerce(other))
-  def __matmul__(self, other): return Torchish(self.value @ _coerce(other))
+  def __matmul__(self, other): return HANDLED_FUNCTIONS[torch.matmul](self, other)
   def __mod__(self, other): return Torchish(self.value % _coerce(other))
   def __mul__(self, other): return Torchish(self.value * _coerce(other))
   def __neg__(self): return Torchish(-self.value)
-  def __pow__(self, other): return Torchish(self.value ** _coerce(other))
+  def __pow__(self, other): return HANDLED_FUNCTIONS[torch.pow](self, other)
   def __radd__(self, other): return Torchish(_coerce(other) + self.value)
-  def __rmatmul__(self, other): return Torchish(_coerce(other) @ self.value)
+  def __rmatmul__(self, other): return HANDLED_FUNCTIONS[torch.matmul](other, self)
   def __rmod__(self, other): return Torchish(_coerce(other) % self.value)
   def __rmul__(self, other): return Torchish(_coerce(other) * self.value)
-  def __rpow__(self, other): return Torchish(_coerce(other) ** self.value)
+  def __rpow__(self, other): return HANDLED_FUNCTIONS[torch.pow](other, self)
   def __rsub__(self, other): return Torchish(_coerce(other) - self.value)
-  def __rtruediv__(self, other): return Torchish(_coerce(other) / self.value)
+  def __rtruediv__(self, other):
+    (value, other), _ = _autocast_args(torch.Tensor.__rtruediv__, (self, other), {})
+    return Torchish(_coerce(other) / value.value)
   def __setitem__(self, key, value):
     self.value = self.value.at[torch_tree_map(_coerce, key)].set(_coerce(value))
   def __sub__(self, other): return Torchish(self.value - _coerce(other))
@@ -473,6 +475,72 @@ def _args_to_shape(args):
   return args if isinstance(args[0], int) or _is_symbolic_dim(args[0]) else args[0]
 
 
+# CUDA policies for supported operations, following ATen/autocast_mode.h.
+_AUTOCAST_LOW = frozenset(
+  (
+    torch.matmul,
+    torch.einsum,
+    torch.nn.functional.linear,
+    torch.nn.functional.conv1d,
+    torch.nn.functional.conv2d,
+    torch.nn.functional.conv3d,
+    torch.nn.functional.conv_transpose2d,
+    torch.nn.functional.prelu,
+    torch.nn.functional.scaled_dot_product_attention,
+  )
+)
+_AUTOCAST_FP32 = frozenset(
+  (
+    torch.exp,
+    torch.log,
+    torch.pow,
+    torch.rsqrt,
+    torch.norm,
+    torch.softmax,
+    torch.sum,
+    torch.cumsum,
+    torch.Tensor.__rtruediv__,
+    torch.nn.functional.softplus,
+    torch.nn.functional.layer_norm,
+    torch.nn.functional.group_norm,
+    torch.nn.functional.normalize,
+    torch.nn.functional.softmax,
+    torch.nn.functional.softmin,
+  )
+)
+
+
+def _autocast_args(function, args, kwargs):
+  if torch.is_autocast_enabled("cpu"):
+    raise NotImplementedError("torch2jax currently supports CUDA autocast, not CPU autocast")
+  if not torch.is_autocast_enabled("cuda") or kwargs.get("out") is not None or kwargs.get("dtype") is not None:
+    return args, kwargs
+  dtype = torch.get_autocast_dtype("cuda")
+  if function in _AUTOCAST_FP32:
+    dtype = torch.float32
+  elif function is torch.nn.functional.interpolate:
+    mode = kwargs.get("mode", args[3] if len(args) > 3 else "nearest")
+    if mode == "area":
+      return args, kwargs
+    dtype = torch.float32
+  elif function is torch.scatter_add:
+    tensors = [x for x in torch.utils._pytree.tree_leaves((args, kwargs)) if isinstance(x, Torchish)]
+    eligible = [x.dtype for x in tensors if x.dtype in (torch.float16, torch.bfloat16, torch.float32)]
+    if builtins.any(t not in (dtype, torch.float32) for t in eligible):
+      raise RuntimeError("Unexpected floating ScalarType in autocast promotion")
+    if torch.float32 in eligible:
+      dtype = torch.float32
+  elif function not in _AUTOCAST_LOW:
+    return args, kwargs
+
+  def cast(value):
+    if isinstance(value, Torchish) and value.dtype in (torch.float16, torch.bfloat16, torch.float32):
+      return Torchish(value.value.astype(t2j_dtype(dtype)))
+    return value
+
+  return torch_tree_map(cast, (args, kwargs))
+
+
 def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchish_member=False):
   """Register a torch function override"""
 
@@ -480,6 +548,10 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
     def scoped_func(*args, **kwargs):
       with jax.named_scope("t2j/" + torch_function.__name__):
         return func(*args, **kwargs)
+
+    def autocast_func(*args, **kwargs):
+      args, kwargs = _autocast_args(torch_function, args, kwargs)
+      return scoped_func(*args, **kwargs)
 
     if out_kwarg:
 
@@ -492,11 +564,11 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
           torch_tree_map(assign, out, ret)
           return out
         else:
-          return torch_tree_map(Torchish, func(*args, **kwargs))
+          return torch_tree_map(Torchish, autocast_func(*args, **kwargs))
     elif Torchishify_output:
-      func1 = lambda *args, **kwargs: torch_tree_map(Torchish, scoped_func(*args, **kwargs))
+      func1 = lambda *args, **kwargs: torch_tree_map(Torchish, autocast_func(*args, **kwargs))
     else:
-      func1 = scoped_func
+      func1 = autocast_func
     functools.update_wrapper(func1, torch_function)
     HANDLED_FUNCTIONS[torch_function] = func1
     if Torchish_member:
@@ -506,7 +578,7 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
       if hasattr(torch.Tensor, name + "_"):
 
         def func1_(self, *args, **kwargs):
-          self.value = func1(self, *args, **kwargs).value
+          self.value = _coerce(scoped_func(self, *args, **kwargs))
           return self
 
         setattr(Torchish, name + "_", func1_)
@@ -2264,6 +2336,8 @@ class TorchishMode(TorchFunctionMode):
 
     implementation = self.torch_function_overrides.get(func, HANDLED_FUNCTIONS.get(func))
     if implementation is not None:
+      if func in self.torch_function_overrides:
+        args, kwargs = _autocast_args(func, args, kwargs)
       return implementation(*args, **kwargs)
     else:
       raise NotImplementedError(
