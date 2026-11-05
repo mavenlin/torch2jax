@@ -578,7 +578,14 @@ def implements(torch_function, Torchishify_output=True, out_kwarg=False, Torchis
       if hasattr(torch.Tensor, name + "_"):
 
         def func1_(self, *args, **kwargs):
-          self.value = _coerce(scoped_func(self, *args, **kwargs))
+          value = _coerce(scoped_func(self, *args, **kwargs))
+          if torch_function in (torch.add, torch.sub, torch.mul, torch.div):
+            if value.shape != self.shape:
+              raise RuntimeError(f"output shape {self.shape} doesn't match the broadcast shape {value.shape}")
+            if not torch.can_cast(j2t_dtype(value.dtype), self.dtype):
+              raise RuntimeError(f"result type {j2t_dtype(value.dtype)} can't be cast to output type {self.dtype}")
+            value = value.astype(self.value.dtype)
+          self.value = value
           return self
 
         setattr(Torchish, name + "_", func1_)
@@ -718,6 +725,7 @@ def _assert(condition, message):
 
 @implements(torch.arange, out_kwarg=True)
 def arange(*args, **kwargs):
+  args = tuple(_coerce(arg) for arg in args)
   dtype = t2j_dtype(
     kwargs.get(
       "dtype",
@@ -1201,6 +1209,11 @@ def randperm(
 @implements(torch.promote_types, Torchishify_output=False)
 def promote_types(type1: torch.dtype, type2: torch.dtype) -> torch.dtype:
   return torch.promote_types(type1, type2)
+
+
+@implements(torch.can_cast, Torchishify_output=False)
+def can_cast(from_: torch.dtype, to: torch.dtype) -> bool:
+  return torch.can_cast(from_, to)
 
 
 @implements(torch._C._set_grad_enabled, Torchishify_output=False)
@@ -2207,7 +2220,9 @@ def scaled_dot_product_attention(
     else:
       raise ValueError(f"Unsupported attn_mask dtype: {attn_mask.dtype}. Expected bool or float.")
   head_dim = Q.shape[-1]
-  use_cudnn = jax.default_backend() == "gpu" and head_dim <= 256 and head_dim % 8 == 0
+  use_cudnn = (
+    jax.default_backend() == "gpu" and Q.dtype in (jnp.float16, jnp.bfloat16) and head_dim <= 256 and head_dim % 8 == 0
+  )
   if use_cudnn:
     from jax._src.cudnn.fused_attention_stablehlo import MaskType
     from jax._src.nn.functions import cudnn_dot_product_attention
