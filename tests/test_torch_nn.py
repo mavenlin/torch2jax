@@ -513,6 +513,31 @@ def test_torch_nn_functional_oneliner():
   t2j_function_test(torch.nn.functional.threshold, [(6, 6)], kwargs=dict(threshold=0.0, value=1.0), atol=1e-6)
 
 
+@pytest.mark.parametrize("dtype,tolerance", [(torch.float32, 2e-5), (torch.float16, 0.003), (torch.bfloat16, 0.03)])
+def test_scaled_dot_product_attention_dtype(monkeypatch, dtype, tolerance):
+  if dtype == torch.float16 and jax.default_backend() == "cpu":
+    pytest.skip("XLA FP16 attention requires an unsupported CPU dot algorithm")
+  if dtype == torch.float32:
+    # Exercise GPU backend selection on CPU CI as well, without mocking attention.
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+
+  def call(q, k, v):
+    # Compare FP32 outputs/gradients: PyTorch BF16 cannot convert directly to NumPy.
+    result = torch.nn.functional.scaled_dot_product_attention(*(x.to(dtype) for x in (q, k, v)))
+    assert result.dtype == dtype
+    return result.float()
+
+  with jax.default_matmul_precision("float32"):
+    t2j_function_test(
+      call,
+      [(1, 2, 4, 8)] + [(1, 2, 6, 8)] * 2,
+      num_tests=1,
+      rtol=tolerance,
+      atol=tolerance,
+      strict=True,
+    )
+
+
 def test_torch_nn_functional_scaled_dot_product_attention():
   t2j_function_test(lambda x, y: x @ y, [(2, 3, 5), (5, 7)], atol=1e-6)
 
